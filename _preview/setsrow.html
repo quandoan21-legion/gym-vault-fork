@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Sets dial harness</title>
+<link rel="stylesheet" href="gym.css">
+<style>
+  body{margin:0;padding:16px;background:#e9e9e4;font-family:system-ui,sans-serif}
+  .frame{border:1px solid #bbb;background:#fff;width:390px;margin-bottom:20px}
+  h2{font:600 12px/1.4 system-ui;letter-spacing:.08em;text-transform:uppercase;color:#555;margin:0 0 6px}
+  .out{font:12px/1.6 ui-monospace,Menlo,monospace;color:#333;padding:8px 0 2px}
+</style></head>
+<body>
+<script src="bundle.js"></script>
+<script>
+  /* The REAL setsBlock, not a replica. The previous version of this page
+     hand-built the markup it was meant to be checking, which is a harness
+     that stops matching what ships the moment the screen changes — exactly
+     what happened when nine rows became one field. */
+  var setsBlock = window.__setsBlock;
+  var setsForItem = window.__setsForItem;
+
+  /* itemSets() reads `it.sets || 3`, so null means "the plan didn't say". */
+  function day() {
+    var counts = [].slice.call(arguments);
+    var names = ['Push-ups', 'Bodyweight Squat', 'Plank', 'Tricep Dips'];
+    var targets = ['15', '25', '90s', '15'];
+    return { items: counts.map(function (n, i) {
+      return { exercise: names[i] || ('Move ' + (i + 1)), sets: n, target: targets[i] || '10' };
+    }) };
+  }
+
+  function frame(title, d, ui) {
+    var h = document.createElement('h2'); h.textContent = title;
+    var f = document.createElement('div'); f.className = 'frame';
+    var app = document.createElement('div');
+    app.className = 'gv-app gv-narrow gv-skin-floor gv-accent-lime';
+    /* gv-guidesetup is a CHILD of gv-app in the real view (it lives inside
+       main.gv-page), and the screen's ink rules are written as descendant
+       selectors. Putting both classes on ONE node here silently stopped
+       every one of them matching, and the harness showed lime the app does
+       not ship. Mirror the real nesting. */
+    var screen = document.createElement('div');
+    screen.className = 'gv-guidesetup';
+    app.append(screen);
+    var out = document.createElement('div'); out.className = 'out';
+    var readout = function () {
+      out.textContent = 'per-entry -> [' + d.items.map(function (it, i) {
+        return setsForItem(ui, it, i);
+      }).join(', ') + ']';
+    };
+    screen.append(setsBlock(null, d, ui, readout));
+    app.append(out);
+    readout();
+    f.append(app);
+    document.body.append(h, f);
+  }
+
+  /* The three states the one field has to tell apart. */
+  frame('Uniform plan (3 each)', day(3, 3, 3, 3), { sets: {} });
+  frame('Mixed plan (3, 1, 3, 1) — must NOT show a single number', day(3, 1, 3, 1), { sets: {} });
+  frame('Already levelled to 4 — reset offered', day(3, 1, 3, 1), { sets: { 0: 4, 1: 4, 2: 4, 3: 4 } });
+</script>
+</body></html>

@@ -1,0 +1,838 @@
+'use strict';
+/* App controller — owns the loaded data, the current page, navigation, and
+   the vault watcher. One controller per open view. */
+
+const { Notice, normalizePath } = require('obsidian');
+const { el, ico, clear, emptyLine } = require('./dom');
+const { makeIo } = require('./data');
+const { ConfirmModal } = require('./modals');
+const { isPaused } = require('./plan-parse');
+const { makeDraftStore, EMPTY, LOST } = require('./draft-store');
+const voiceClips = require('./voice-clips');
+const sound = require('./sound');
+const { skinClasses } = require('./constants');
+const pages = {
+  dashboard: require('./page-dashboard'),
+  exercises: require('./page-exercises'),
+  plans: require('./page-plans'),
+  goals: require('./page-goals'),
+  history: require('./page-history'),
+  profile: require('./page-profile'),
+  running: require('./page-running'),
+  reading: require('./page-reading'),
+  chess: require('./page-chess'),
+  pomodoro: require('./page-pomodoro'),
+  configure: require('./page-configure'),
+  export: require('./page-export'),
+  browse: require('./page-browse'),
+  log: require('./page-log'),
+  exercise: require('./page-exercise-detail'),
+  records: require('./page-records'),
+  'run-records': require('./page-run-records'),
+  voice: require('./page-voice'),
+  setup: require('./page-session-setup'),
+  session: require('./page-session'),
+};
+
+/* K4 (usability fix wave 20 Oct 2026, M-01): how short is the PANE? The live
+   set screen needs ~830px of pane to lay out at full size, and a phone's pane
+   is the window less Obsidian's bars (an iPhone 15's 852px window is a 741px
+   pane), so the compaction that used to key on `@media (max-height)` — the
+   WINDOW — never fired where it was needed. controller.js puts `gv-short` on the
+   view root at SHORT_PANE_PX and under, and `gv-shorter` (as well) at
+   SHORTER_PANE_PX and under; styles.css keys on those. 0 means "not measured
+   yet" (a hidden pane reports 0 x 0) and is neither. */
+const SHORT_PANE_PX = 860;
+const SHORTER_PANE_PX = 680;
+function paneHeightTier(h) {
+  if (!(h > 0)) return 0;
+  if (h <= SHORTER_PANE_PX) return 2;
+  return h <= SHORT_PANE_PX ? 1 : 0;
+}
+
+const NAV = [
+  /* Five primary tabs for a personal vault: Today, then the three activities
+     (Gym / Reading / Chess), then Configure. Gym's setup pages (Exercises,
+     Plans, Goals) + Records live under Configure rather than each taking a tab;
+     those page modules still exist and are reached from the Configure hub. */
+  { id: 'dashboard', label: 'Today', icon: 'flame' },
+  /* "Gym" is the gym activity page (the old History log), beside Reading and
+     Chess. Kept id 'history' so every ctx.nav('history') / back-stack still
+     works; only the label + icon changed. */
+  { id: 'history', label: 'Gym', icon: 'dumbbell' },
+  { id: 'reading', label: 'Reading', icon: 'book-open' },
+  { id: 'chess', label: 'Chess', icon: 'crown' },
+  { id: 'pomodoro', label: 'Focus', icon: 'timer' },
+  { id: 'configure', label: 'Configure', icon: 'sliders-horizontal' },
+  /* place:'head' — utility destinations live top-right beside the logo, not
+     in the main nav. */
+  { id: 'profile', label: 'Profile', icon: 'user', place: 'head' },
+  { id: 'export', label: 'Export', icon: 'share-2', place: 'head' },
+];
+
+/* THE DAY-RESOLUTION RULE, pure and exported.
+
+   It lives out here rather than inside mountApp because the closure form was
+   only ever testable by writing a second copy of it in the guard suite, and
+   "two figures derived by different rules" is this codebase's recurring bug
+   shape — a modelled rule that has quietly stopped matching the real one is
+   the same failure wearing a test's clothes. ctx.daysOn is now a thin
+   wrapper over this.
+
+   Order matters and is the contract: the active plan's own weekday first,
+   then its `any` day if it claims this weekday no other way, then every
+   parallel plan, then — only when nothing at all is scheduled — one
+   fallback plan. */
+function resolveDaysOn(weekday, activePlan, parallelPlans, fallbackPlans) {
+  const out = [];
+  if (activePlan) {
+    const own = activePlan.model.days.filter(d => d.weekday === weekday);
+    for (const d of own) out.push({ plan: activePlan, day: d });
+    /* A plan whose days are ALL `(any)` used to schedule nothing at all: the
+       wildcard was honoured only for FALLBACK plans, so making one active
+       left every weekday resolving to the rest plan instead, and every Start
+       button on the plan's own page ghosted. Ten plans in the shared library
+       are shaped exactly that way, and their own prose promises they "fill
+       whatever day is otherwise empty".
+
+       An exact weekday still wins over the wildcard — that is what
+       `own.length` tests — so a mixed plan (three named days plus an `any`)
+       behaves the way its author meant. */
+    if (!own.length) {
+      const anyDay = activePlan.model.days.find(d => d.weekday === 'any');
+      if (anyDay) out.push({ plan: activePlan, day: anyDay });
+    }
+  }
+  for (const p of parallelPlans || []) {
+    for (const d of p.model.days) if (d.weekday === weekday) out.push({ plan: p, day: d });
+  }
+  /* Nothing training-related today? A fallback plan (rest & recovery) fills
+     the gap — an exact weekday match first, then its `any` day. */
+  if (!out.length) {
+    for (const p of fallbackPlans || []) {
+      const day = p.model.days.find(d => d.weekday === weekday) || p.model.days.find(d => d.weekday === 'any');
+      if (day) { out.push({ plan: p, day }); break; }
+    }
+  }
+  return out;
+}
+
+/* WHICH PLANS RUN ALONGSIDE, pure and exported (0.13.1, paused).
+
+   ctx.parallelPlans / ctx.fallbackPlans are thin wrappers over these, for the
+   same reason ctx.daysOn wraps resolveDaysOn: the closure form could only be
+   tested by writing a second copy of the rule.
+
+   A PAUSED plan (plan-parse.js isPaused) is left out unless `includePaused`
+   is set. Today builds its days from the filtered lists; the one caller that
+   needs every plan whether or not it is switched on is runPlanOf. */
+const isParallelPlan = p => String(p.fm.parallel) === 'true';
+const isFallbackPlan = p => String(p.fm.fallback) === 'true';
+function parallelPlansOf(plans, opts) {
+  const all = !!(opts && opts.includePaused);
+  return (plans || []).filter(p => isParallelPlan(p) && !isFallbackPlan(p) && (all || !isPaused(p)));
+}
+function fallbackPlansOf(plans, opts) {
+  const all = !!(opts && opts.includePaused);
+  return (plans || []).filter(p => isFallbackPlan(p) && (all || !isPaused(p)));
+}
+
+/* The plan the Running page reads its ladder and run days from. Chosen from
+   EVERY parallel plan, paused or not: pausing "Trail Base" stops its days
+   landing on Today, and must not blank the Running page's ladder and targets
+   (the page's own data, not Today's schedule). `isRunExercise(name)` says
+   whether an exercise is measured in km. */
+function runPlanOf(plans, isRunExercise) {
+  const all = parallelPlansOf(plans, { includePaused: true });
+  return all.find(p => p.model.days.some(d => d.items.some(i => isRunExercise(i.exercise)))) || all[0] || null;
+}
+
+/* True when NOTHING carries the active flag and activePlan() is merely
+   falling back to the first main plan. Every downloaded plan arrives
+   `active: false`, so deleting the seeded plan leaves Today confidently
+   driving a plan the Plans list does not badge. Exported for the same reason
+   as the rule above: the dashboard's notice and the guard that pins it must
+   read one implementation. */
+function isImplicitActive(mainPlans) {
+  const main = mainPlans || [];
+  return main.length > 0 && !main.some(p => String(p.fm.active) === 'true');
+}
+
+/* How an in-progress draft names itself on the Today screen. */
+function describeDraft(draft) {
+  if (!draft) return '';
+  if (draft.day && draft.plan) return `${draft.day} · ${draft.plan}`;
+  return draft.day || draft.plan || 'Freestyle session';
+}
+
+function mountApp(view) {
+  const plugin = view.plugin;
+  const app = plugin.app;
+  const io = makeIo(plugin);
+
+  const ctx = {
+    app, plugin, io, view,
+    settings: plugin.settings,
+    data: null,
+    /* session: guided-mode UI state ONLY (position, phase, timers) — the
+       draft itself stays on logDraft, per ONE DRAFT, TWO VIEWS. pageCleanup
+       is a one-shot teardown any page can register (wake lock, confetti rAF)
+       that ctx.nav runs the moment the page actually changes. */
+    /* setup/setupUi: the pending {plan, day} and the choices being made on
+       the setup screen — deliberately NOT a draft. Nothing exists until
+       Start, so backing out of setup leaves the vault untouched.
+       sessionCarry: a one-shot handoff for the tally a guided session had
+       accumulated (records/goalCount/metGoals) when the page was last left —
+       written by page-session.js's own pageCleanup, tied to the draft it
+       belongs to, and consumed exactly once by the next fresh session built
+       for that SAME draft (see page-session.js's render() and its own
+       comment, 0.11.2 journey audit finding L9).
+       rewardsCache: the parsed rewards ledger for the data currently loaded,
+       read once per render cycle (rewards-flow.js readLedger). */
+    state: { page: 'dashboard', params: {}, session: null, setup: null, setupUi: null, pageCleanup: null, sessionCarry: null, rewardsCache: null },
+    _interval: null,
+    /* Set by ctx.nav() only (never by a plain ctx.rerender() from local UI
+       state — ticking a set, toggling a switch — which must NOT steal focus
+       mid-interaction). Consumed once by the focus-move at the bottom of
+       ctx.rerender(). */
+    _focusPageOnRender: false,
+  };
+
+  /* THE SESSION IN PROGRESS IS KEPT ON THIS DEVICE (0.12.1, audit L3-01). It
+     used to live only in memory, so an iOS kill after the Music button, a
+     call, closing the tab or a plugin update lost every finished set; see
+     draft-store.js for what is kept, where, and why not in the vault.
+
+     logDraft is an ACCESSOR so that every existing assignment site — Start,
+     Discard, "Discard and start", Finish — keeps or clears the stored copy
+     without being touched one by one. The edits that do NOT assign (a set
+     ticked, a figure typed, an exercise added) are caught where they all
+     funnel: ctx.rerender, every nav, ctx.persistDraft for typed figures that
+     must not re-render, and the page going to the background. Clearing is
+     tied to THIS controller having held a draft: a second Gym view with none
+     of its own must never wipe the first one's. */
+  const draftStore = makeDraftStore(app);
+  let logDraft = null;
+  let draftStatus = EMPTY;
+  /* Never throws: the store catches its own storage failures, but the
+     snapshot is taken before it gets there, and a workout must never fail
+     because its safety copy did. A copy that could not be taken is LOST, so
+     the close notice stays honest. */
+  const keepDraft = () => {
+    if (!logDraft) return draftStatus;
+    try { draftStatus = draftStore.save(logDraft); } catch (e) { draftStatus = LOST; }
+    return draftStatus;
+  };
+  Object.defineProperty(ctx.state, 'logDraft', {
+    enumerable: true, configurable: true,
+    get: () => logDraft,
+    set: next => {
+      const had = !!logDraft;
+      logDraft = next || null;
+      if (logDraft) keepDraft();
+      else if (had) { draftStore.clear(); draftStatus = EMPTY; }
+    },
+  });
+  ctx.persistDraft = keepDraft;
+
+  const rootEl = view.contentEl;
+  rootEl.addClass('gv-app');
+
+  /* Skin + accent are classes on the app root; re-synced on every reload so
+     a settings change lands without reopening the view. */
+  const syncChrome = () => {
+    for (const cls of [...rootEl.classList]) {
+      if (cls.indexOf('gv-skin-') === 0 || cls.indexOf('gv-accent-') === 0) rootEl.classList.remove(cls);
+    }
+    rootEl.classList.add(...skinClasses(plugin.settings.skin || 'apex'), `gv-accent-${plugin.settings.accent || 'lime'}`);
+  };
+  syncChrome();
+
+  let navEl = null, pageEl = null, headActionsEl = null;
+
+  ctx.notice = msg => new Notice(`Gym: ${msg}`, 5000);
+
+  /* A plan marked `parallel` is not an ALTERNATIVE to the active plan — it
+     runs alongside it (running beside strength), so the dashboard merges
+     days from the active plan and every parallel one. */
+  const isParallel = p => String(p.fm.parallel) === 'true';
+  ctx.activePlan = () => {
+    if (!ctx.data) return null;
+    const main = ctx.data.plans.filter(p => !isParallel(p));
+    return main.find(p => String(p.fm.active) === 'true') || main[0] || null;
+  };
+  ctx.activePlanIsImplicit = () =>
+    (ctx.data ? isImplicitActive(ctx.data.plans.filter(p => !isParallel(p))) : false);
+  const isFallback = p => String(p.fm.fallback) === 'true';
+  /* Paused plans are skipped (parallelPlansOf / fallbackPlansOf): Today, the
+     week strip and the plan switcher all read these two. */
+  ctx.parallelPlans = () => (ctx.data ? parallelPlansOf(ctx.data.plans) : []);
+  ctx.fallbackPlans = () => (ctx.data ? fallbackPlansOf(ctx.data.plans) : []);
+  /* Every non-parallel plan, for the switcher. */
+  ctx.mainPlans = () => (ctx.data ? ctx.data.plans.filter(p => !isParallel(p) && !isFallback(p)) : []);
+  const isRunExercise = name => !!ctx.data && ctx.data.exercises.some(e =>
+    e.name.toLowerCase() === (name || '').toLowerCase() && (e.fm.unit || '') === 'km');
+  /* From the UNFILTERED parallel plans: a paused running plan still owns the
+     Running page's ladder (see runPlanOf). */
+  ctx.runPlan = () => (ctx.data ? runPlanOf(ctx.data.plans, isRunExercise) : null);
+  /* Every {plan, day} scheduled on a weekday, active plan first. The rule
+     itself is resolveDaysOn, up at the top of this file — see its comment
+     for why it is not written out here any more. */
+  ctx.daysOn = weekday => resolveDaysOn(weekday, ctx.activePlan(), ctx.parallelPlans(), ctx.fallbackPlans());
+  ctx.openFile = file => { app.workspace.getLeaf('tab').openFile(file); };
+
+  /* A BACK STACK, so Back returns to where you came FROM.
+
+     Nested pages used to hardcode their destination: Running records always
+     went to Running, exercise detail always to the Exercises library. So
+     Records -> Running records -> Back landed on Running rather than
+     Records, and reaching an exercise from a record dropped you in the
+     library you had not been in. There was no route stack to consult.
+
+     Deliberately shallow. A tap on a PRIMARY nav tab is a fresh start, not
+     a descent, so it clears the stack — otherwise Back would eventually walk
+     you backwards through an entire session's browsing. The cap is the same
+     idea: this exists to get you out of two or three nested pages, and a
+     stack that remembers forever is a stack nobody can predict. */
+  const MAX_BACK = 10;
+  ctx._backStack = [];
+
+  /* The route change itself, with no stack bookkeeping — ctx.back() uses this
+     directly so that returning somewhere cannot push the page you just left,
+     which would make Back a toggle between two screens. */
+  const applyNav = (page, params) => {
+    /* Leaving a page that registered cleanup (guided mode's wake lock and
+       any in-flight confetti burst) tears it down exactly once — even when
+       the user bails via the persistent nav bar rather than guided mode's
+       own exit button. A re-nav to the SAME page (e.g. a refresh) must not
+       trigger it. */
+    if (ctx.state.pageCleanup && page !== ctx.state.page) {
+      try { ctx.state.pageCleanup(); } catch (e) { console.error('gym-vault page cleanup', e); }
+      ctx.state.pageCleanup = null;
+    }
+    ctx.state.page = page;
+    ctx.state.params = params || {};
+    /* A route change is exactly what SHOULD move focus — plain rerenders
+       from local UI state (a tick, a toggle) must not. */
+    ctx._focusPageOnRender = true;
+    ctx.rerender();
+  };
+
+  ctx.nav = (page, params, opts) => {
+    if (opts && opts.reset) ctx._backStack.length = 0;
+    else if (page !== ctx.state.page) {
+      /* A re-nav to the same page is a refresh, not a step — pushing it
+         would make Back land where you already are. */
+      ctx._backStack.push({ page: ctx.state.page, params: ctx.state.params || {} });
+      if (ctx._backStack.length > MAX_BACK) ctx._backStack.shift();
+    }
+    applyNav(page, params);
+  };
+
+  /* Where Back would go, or the fallback when nothing is remembered — the
+     first visit to a nested page has no caller. Read by the back buttons so
+     their label names the real destination instead of a generic "Back". */
+  ctx.backTo = fallback => {
+    const prev = ctx._backStack[ctx._backStack.length - 1];
+    return prev ? prev.page : fallback;
+  };
+
+  ctx.back = fallback => {
+    const prev = ctx._backStack.pop();
+    if (prev) applyNav(prev.page, prev.params);
+    else applyNav(fallback, null);
+  };
+
+  /* A DRAFT IS NOT DISPOSABLE. startDraft and beginSession both replace
+     ctx.state.logDraft outright, and the nav bar is visible during rest and
+     on the completion screen — so one thumb-slip mid-session ("Today", then
+     "Get after it") used to throw away every completed set with no warning
+     and nothing to undo it. The nav handler's own comment has promised since
+     0.5 that "coming back to Today offers the log page again"; nothing ever
+     read the draft back, so this is that promise, kept in two halves:
+     ctx.resumeDraft() is the way back in (the dashboard offers it), and
+     everything that would REPLACE a live draft asks first. */
+  ctx.describeDraft = () => describeDraft(ctx.state.logDraft);
+  /* Back into the draft by way of the log overview — the "one draft, two
+     views" hub, which shows what is already ticked and keeps Guided one tap
+     away. Deliberately NOT straight into guided mode: a manually typed draft
+     and a guided one are the same object, and only the overview is right for
+     both. */
+  ctx.resumeDraft = () => { if (ctx.state.logDraft) ctx.nav('log'); };
+
+  const replacingDraft = onProceed => {
+    if (!ctx.state.logDraft) { onProceed(); return; }
+    new ConfirmModal(app, {
+      title: 'A session is already open',
+      message: `${ctx.describeDraft()} is still in progress. Starting a new one discards everything logged in it.`,
+      confirmLabel: 'Discard and start',
+      onConfirm: () => { ctx.state.logDraft = null; onProceed(); },
+    }).open();
+  };
+
+  /* `opts` reaches startDraft untouched: Running › This week passes { date }
+     to log a PAST day under that day's date (startDraft refuses a future one). */
+  ctx.startLog = (plan, day, opts) => replacingDraft(() => {
+    pages.log.startDraft(ctx, plan, day, opts);
+    ctx.nav('log');
+  });
+
+  /* Enter guided mode over whatever draft already exists in
+     ctx.state.logDraft — page-session.js routes to the dashboard if there
+     isn't one. session=null forces a fresh initialPosition() so re-entering
+     always resumes at the first actually-incomplete set, honouring anything
+     ticked on the overview since guided mode was last open.
+
+     THE POSITION RESETS; THE TALLY DOES NOT. A record broken, or a goal
+     met, before "Review in log" is real regardless of what screen you were
+     looking at when it happened, and the completion screen reads both off
+     the session's own accumulated total — so wiping ctx.state.session here
+     must not also wipe what it had already earned. That half of the state
+     is carried separately: see page-session.js's pageCleanup (which stashes
+     it, tied to the draft) and its render() (which picks it back up for
+     that same draft only — a genuinely new draft must never inherit an old
+     session's tally just because one happened to still be sitting there). */
+  ctx.enterGuided = () => {
+    /* THE GESTURE, AT THE SEAM. iOS permits speechSynthesis and AudioContext
+       only for a page that has used them from inside a real user-gesture call
+       stack, and guided mode is where this app first makes a noise on a TIMER
+       — the interval announcement and the spoken "3, 2, 1".
+
+       beginSession unlocks in the Start tap, so the setup route was fine. The
+       log overview's Guided button called this directly and unlocked nothing,
+       so Dashboard -> Log manually -> Guided — a first-run path — ran the
+       whole session silent on a phone, with no error and nothing to explain
+       it. Putting it HERE covers every route into guided mode, including the
+       next one somebody adds.
+
+       Every caller reaches this synchronously from a click, which is the
+       whole requirement; unlock() is idempotent and never throws, so calling
+       it again after beginSession's costs nothing. */
+    sound.unlock();
+    ctx.state.session = null;
+    ctx.nav('session');
+  };
+  /* Starting a session goes through the setup screen (page-session-setup.js):
+     it asks how you want to be guided and for how long, then builds the draft
+     itself. It deliberately does NOT create a draft here — half the point of
+     that screen is that backing out of it costs nothing.
+
+     NAMES, not object references. The user can sit on the setup screen for a
+     minute, and any vault change in that window (an iCloud sync landing, an
+     edit in another pane) fires ctx.reload(), which replaces ctx.data
+     wholesale — a held reference would then be a snapshot of a plan that no
+     longer exists, and the session would be built from it. The index is kept
+     only as a fallback for the pathological case of two days sharing a name. */
+  ctx.startGuided = (plan, day) => replacingDraft(() => {
+    const dayIndex = plan && day ? plan.model.days.indexOf(day) : -1;
+    ctx.state.setup = {
+      plan: plan ? plan.name : null,
+      day: day ? day.name : null,
+      dayIndex,
+    };
+    ctx.state.setupUi = null;
+    ctx.nav('setup');
+  });
+
+  /* A page may register one interval (the log clock); it's cleared on every
+     rerender and on unmount so a closed pane never keeps a timer alive. */
+  ctx.setPageInterval = (fn, ms) => {
+    if (ctx._interval) window.clearInterval(ctx._interval);
+    ctx._interval = window.setInterval(fn, ms);
+  };
+
+  /* Route change gets no signal a screen-reader user can pick up otherwise —
+     the page under the persistent nav bar is swapped in place, so nothing
+     announces "you're on a new screen now". Moving focus to the new page's
+     own heading is the same pattern any SPA route change needs; tabindex=-1
+     makes an otherwise non-interactive heading a valid focus target without
+     adding it to the normal Tab order. */
+  function focusPageHeading() {
+    if (!ctx._focusPageOnRender) return;
+    ctx._focusPageOnRender = false;
+    if (!pageEl) return;
+    const heading = pageEl.querySelector('h1, h2, h3, h4, h5, h6');
+    if (!heading) return;
+    if (!heading.hasAttribute('tabindex')) heading.setAttribute('tabindex', '-1');
+    heading.focus({ preventScroll: true });
+  }
+
+  /* Has Obsidian's metadata cache finished its first pass? `initialized` is
+     false until it has (it is not in the published typings, so only an
+     EXPLICIT false counts as "still indexing" — a host that does not say is
+     treated as done, because the cost of guessing wrong that way is a setup
+     card that a reload corrects, and the cost of the other way was an endless
+     wait). The `resolved` event is the other signal: it fires when the cache
+     settles, and start() sets this when it does. */
+  let cacheSettled = false;
+  const stillIndexing = () => !cacheSettled && !!app.metadataCache && app.metadataCache.initialized === false;
+
+  ctx.rerender = () => {
+    /* Every tick, untick, added set and finished set re-renders, and so does
+       every nav (applyNav ends here) — the one place all of them pass. */
+    keepDraft();
+    if (ctx._interval) { window.clearInterval(ctx._interval); ctx._interval = null; }
+    if (!pageEl) return;
+    /* Preserve scroll on an IN-PLACE rerender (a tick, a toggle, expanding a
+       history card — all call ctx.rerender). Only a route change jumps to the
+       top: applyNav sets ctx._focusPageOnRender, read below. Captured here
+       before clear() empties the page and zeroes scrollTop. */
+    const prevScroll = pageEl.scrollTop;
+    clear(pageEl);
+    /* Focus mode is OPT-IN PER RENDER: cleared here, re-added by the counting
+       screens in page-session.js. A sticky class would hide the nav on a page
+       that has no other way out of itself. */
+    rootEl.classList.remove('gv-focus');
+    renderNavState();
+    /* NEVER render nothing. A blank page under the nav is indistinguishable
+       from a broken plugin, and this is exactly what a mid-index vault used
+       to produce: loadAll fails or finds nothing, and the screen goes empty
+       with no way back. */
+    if (!ctx.data || ctx.loadError) {
+      renderNotReady(ctx, pageEl);
+    } else if (!ctx.data.present) {
+      /* The gym folder existing but reading empty MEANS Obsidian has not
+         finished indexing — but only while it has not. Offering "create my
+         gym" mid-index would be wrong and alarming; refusing it for ever once
+         indexing is done (an existing folder with no gym in it yet, e.g. the
+         Gym folder setting pointed at an empty "Training") left a "Waiting"
+         card with a Try again that could never succeed (0.12.1, audit L2-06).
+         Files that could not be read still wait: that is a sync landing, not
+         an empty folder. */
+      if (ctx.data.unreadable || (ctx.data.rootExists && stillIndexing())) {
+        renderNotReady(ctx, pageEl);
+      } else {
+        renderSetup(ctx, pageEl);
+      }
+    } else {
+      const page = pages[ctx.state.page] || pages.dashboard;
+      try { page.render(ctx, pageEl); }
+      catch (e) {
+        console.error('gym-vault render', e);
+        pageEl.append(emptyLine(`Something went wrong rendering this page (${e.message}).`));
+      }
+    }
+    pageEl.scrollTop = ctx._focusPageOnRender ? 0 : prevScroll;
+    focusPageHeading();
+  };
+
+  ctx.reload = async () => {
+    ctx.settings = plugin.settings;
+    try {
+      ctx.data = await io.loadAll();
+      ctx.loadError = null;
+      /* Reading data rides alongside the gym load: a separate JSON the LifeOS
+         pipeline writes (optional — null when it is not there yet). Never let a
+         reading read fail the whole load. */
+      try { if (ctx.data && typeof io.loadReadingSessions === 'function') ctx.data.reading = await io.loadReadingSessions(); }
+      catch (e) { console.error('gym-vault reading load', e); }
+      try { if (ctx.data && typeof io.loadChessSessions === 'function') ctx.data.chess = await io.loadChessSessions(); }
+      catch (e) { console.error('gym-vault chess load', e); }
+      try { if (ctx.data && typeof io.loadPomodoroSessions === 'function') ctx.data.pomodoro = await io.loadPomodoroSessions(); }
+      catch (e) { console.error('gym-vault pomodoro load', e); }
+    } catch (e) {
+      /* Keep whatever we already had rather than blanking the screen — a
+         failed refresh should never cost you the page you were reading. */
+      console.error('gym-vault load', e);
+      ctx.loadError = e.message || String(e);
+    }
+    syncChrome();
+    buildNav();
+    ctx.rerender();
+    /* The user's own clips, decoded into sound.js. Deliberately AFTER the
+       render and never awaited: a session must not wait on forty decodes,
+       and voice-clips.js skips the work entirely when nothing changed. */
+    if (ctx.data && ctx.data.present) {
+      voiceClips.loadClips(io).catch(e => console.error('gym-vault voice clips', e));
+    }
+  };
+
+  /* Rebuilt on every reload. Every NAV entry is unconditional today — the
+     `when` hook survives as the extension point for a tab that genuinely
+     only makes sense sometimes. Running used to use it; see NAV for why it
+     no longer does. */
+  function buildNav() {
+    if (!navEl) return;
+    clear(navEl);
+    if (headActionsEl) clear(headActionsEl);
+    for (const item of NAV) {
+      if (item.when && !item.when(ctx)) continue;
+      const head = item.place === 'head';
+      /* aria-label on EVERY tab: the label span is display:none in a narrow pane (every
+         phone) and Floor/Editorial show the icon alone, so the name has to be on the button. */
+      const b = el('button', {
+        class: head ? 'gv-head-btn' : 'gv-nav-btn',
+        type: 'button', 'data-page': item.id,
+        'aria-label': item.label,
+      }, ico(item.icon), head ? '' : el('span', { class: 'gv-nav-label' }, item.label));
+      b.addEventListener('click', () => {
+        /* Leaving mid-log keeps the draft: coming back to Today offers the
+           log page again via the nav highlight, and Finish/Discard are the
+           only ways to end it. Navigation itself must never eat a session. */
+        /* A primary tab is a fresh start, not a step: it clears the stack,
+           so Back on whatever you open next does not walk you through
+           everywhere you have already been. */
+        ctx.nav(item.id, null, { reset: true });
+      });
+      (head && headActionsEl ? headActionsEl : navEl).append(b);
+    }
+    if (headActionsEl) headActionsEl.append(settingsButton());
+    renderNavState();
+  }
+
+  /* Settings sits beside Profile in the header, but is NOT a NAV entry: it
+     opens Obsidian's own settings dialog rather than routing to a page, so it
+     carries no data-page and renderNavState leaves it alone.
+
+     `app.setting` is not in the published API typings, so every hop is
+     guarded — on a build where it's missing the button explains where to go
+     by hand instead of doing nothing, which is the failure mode a silent
+     no-op would give. */
+  function settingsButton() {
+    const b = el('button', {
+      class: 'gv-head-btn', type: 'button', 'aria-label': 'Personal Vault settings',
+    }, ico('settings'));
+    b.addEventListener('click', () => {
+      const setting = app.setting;
+      const id = plugin.manifest && plugin.manifest.id;
+      if (setting && typeof setting.open === 'function' && typeof setting.openTabById === 'function' && id) {
+        setting.open();
+        setting.openTabById(id);
+        return;
+      }
+      ctx.notice('open Settings → Community plugins → Personal Vault.');
+    });
+    return b;
+  }
+
+  function buildShell() {
+    clear(rootEl);
+    headActionsEl = el('div', { class: 'gv-head-actions' });
+    const head = el('div', { class: 'gv-head' },
+      el('div', { class: 'gv-logo' }, ico('layout-dashboard'), el('span', { class: 'gv-logo-text' }, 'Personal Vault')),
+      headActionsEl);
+    navEl = el('nav', { class: 'gv-nav', 'aria-label': 'Gym sections' });
+    pageEl = el('main', { class: 'gv-page' });
+    rootEl.append(head, navEl, pageEl);
+    buildNav();
+  }
+
+  function renderNavState() {
+    if (!navEl) return;
+    const current = ctx.state.page === 'log' || ctx.state.page === 'session' || ctx.state.page === 'setup' ? 'dashboard'
+      : ctx.state.page === 'exercise' ? 'exercises'
+      : ctx.state.page === 'run-records' ? 'running'
+      : ctx.state.page === 'voice' ? 'profile'
+      : ctx.state.page === 'records' ? 'history'
+      /* Browse hangs off Plans; unmapped, it left NO primary tab lit at all. */
+      : ctx.state.page === 'browse' ? 'plans'
+      : ctx.state.page;
+    const buttons = [
+      ...navEl.querySelectorAll('.gv-nav-btn'),
+      ...(headActionsEl ? headActionsEl.querySelectorAll('.gv-head-btn') : []),
+    ];
+    for (const b of buttons) {
+      const active = b.getAttribute('data-page') === current;
+      b.classList.toggle('on', active);
+      if (active) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    }
+  }
+
+  /* Vault watcher: reload when a gym file changes and the change wasn't one
+     of our own writes (write-guard, same pattern as the budget plugin).
+
+     OWN WRITES ARE TRACKED PER PATH (0.12.1, audit L2-04). A single
+     "we wrote something in the last 1.5 s" stamp hid EVERY gym-folder event
+     for that long, so an edit to a DIFFERENT note landing in the window — an
+     iCloud edit from the other device — was never reloaded, and the next save
+     of that note wrote the stale copy over it. data.js records each path it
+     writes (a rename under both names) in plugin._ownWrites, a
+     Map<vaultPath, ms>; an event is ours only when ITS path, or on a rename
+     its old path, was written inside the window. The map is read at event
+     time because data.js creates it lazily; with none at all the old blanket
+     stamp still applies. */
+  const OWN_WRITE_MS = 1500;
+  const isOwnWrite = (...paths) => {
+    const now = Date.now();
+    const own = plugin._ownWrites;
+    if (!(own instanceof Map)) return now - (plugin._lastWrite || 0) < OWN_WRITE_MS;
+    return paths.some(p => !!p && own.has(p) && now - own.get(p) < OWN_WRITE_MS);
+  };
+  let debounceTimer = null;
+  const onVaultEvent = (f, oldPath) => {
+    if (!f || !f.path) return;
+    const base = normalizePath(plugin.settings.gymFolder || 'Gym');
+    const inGym = p => !!p && (p.startsWith(base + '/') || p === base);
+    /* rename passes (file, oldPath) — a note dragged OUT of the gym folder
+       only matches on its OLD path, and missing it leaves stale data. */
+    if (!inGym(f.path) && !inGym(oldPath)) return;
+    if (isOwnWrite(f.path, oldPath)) return;
+    if (debounceTimer) window.clearTimeout(debounceTimer);
+    debounceTimer = window.setTimeout(() => { debounceTimer = null; ctx.reload(); }, 400);
+  };
+
+  /* Narrow-pane mode tracks the app root's OWN width (a 300px desktop
+     split-pane must compact even when the window is wide — media queries
+     can't see pane width). ResizeObserver is iOS 13.4+, under the floor. */
+  let resizeObs = null;
+  const watchWidth = () => {
+    if (typeof ResizeObserver === 'undefined') return;
+    resizeObs = new ResizeObserver(entries => {
+      const rect = entries[entries.length - 1].contentRect;
+      const w = rect.width;
+      rootEl.classList.toggle('gv-narrow', w > 0 && w <= 480);
+      /* The PANE's height, the same way: a media query sees the window, and the
+         window is 110px taller than the pane an iPhone actually gives a view. */
+      const tier = paneHeightTier(rect.height);
+      rootEl.classList.toggle('gv-short', tier >= 1);
+      rootEl.classList.toggle('gv-shorter', tier >= 2);
+    });
+    resizeObs.observe(rootEl);
+  };
+
+  /* THE LAST CHANCE BEFORE iOS MAY KILL US. A page that goes to the
+     background (the Music button, a call, the app switcher) gets no further
+     code once the system evicts it, so the session is written at the moment
+     it becomes hidden — and again on pagehide, which covers the paths that
+     skip visibilitychange. The document and window come from the view's own
+     root so a pop-out window's events are the ones listened to; both are
+     removed in stop(). */
+  const hostDoc = rootEl.ownerDocument || (typeof document !== 'undefined' ? document : null);
+  const hostWin = (hostDoc && hostDoc.defaultView) || (typeof window !== 'undefined' ? window : null);
+  const onVisibility = () => { if (hostDoc && hostDoc.visibilityState === 'hidden') keepDraft(); };
+  const onPageHide = () => { keepDraft(); };
+
+  /* Another open Gym view already holding a live draft owns it. Restoring the
+     stored copy here too would give one session two independent lives, and
+     banking both would save it twice. */
+  const siblingHoldsDraft = () => {
+    let held = false;
+    if (typeof plugin.forEachView !== 'function') return false;
+    try {
+      plugin.forEachView(ctl => { if (ctl && ctl.ctx !== ctx && typeof ctl.hasDraft === 'function' && ctl.hasDraft()) held = true; });
+    } catch (e) { console.error('gym-vault sibling views', e); }
+    return held;
+  };
+
+  /* A session that was in progress when the app went away comes back as the
+     same Today "Session in progress" card an in-memory one gets (ctx.
+     resumeDraft is the way in). Assigned through the accessor, which writes
+     it straight back — with the clock already corrected for a long gap. */
+  const restoreSession = () => {
+    if (logDraft || siblingHoldsDraft()) return;
+    const back = draftStore.load();
+    if (back) ctx.state.logDraft = back;
+  };
+
+  return {
+    ctx,
+    async start() {
+      buildShell();
+      watchWidth();
+      if (hostDoc) hostDoc.addEventListener('visibilitychange', onVisibility);
+      if (hostWin) hostWin.addEventListener('pagehide', onPageHide);
+      for (const evt of ['modify', 'create', 'delete', 'rename']) {
+        view.registerEvent(app.vault.on(evt, onVaultEvent));
+      }
+      /* Opening the gym while Obsidian is still indexing (a new device, a
+         big iCloud sync) can read an empty or unreadable vault. `resolved`
+         fires when the metadata cache finishes, so reload once more then —
+         otherwise the view sits on whatever the half-indexed vault gave it
+         until some unrelated file event happens to shake it loose. */
+      if (app.metadataCache && app.metadataCache.on) {
+        view.registerEvent(app.metadataCache.on('resolved', () => {
+          /* The cache has settled: from here an existing-but-empty gym folder
+             is a fresh start, not "still indexing" (see stillIndexing). */
+          cacheSettled = true;
+          if (!ctx.data || ctx.loadError || !ctx.data.present) ctx.reload();
+        }));
+      }
+      restoreSession();
+      await ctx.reload();
+    },
+    stop() {
+      /* Closing the view, unloading or updating the plugin: keep what is on
+         the screen, then let go of the page-level listeners. */
+      keepDraft();
+      if (hostDoc) hostDoc.removeEventListener('visibilitychange', onVisibility);
+      if (hostWin) hostWin.removeEventListener('pagehide', onPageHide);
+      if (resizeObs) resizeObs.disconnect();
+      if (ctx._interval) window.clearInterval(ctx._interval);
+      if (debounceTimer) window.clearTimeout(debounceTimer);
+      /* View closing mid-guided-session: release the wake lock / stop any
+         confetti burst the same way navigating away would. */
+      if (ctx.state.pageCleanup) {
+        try { ctx.state.pageCleanup(); } catch (e) { console.error('gym-vault page cleanup', e); }
+        ctx.state.pageCleanup = null;
+      }
+    },
+    hasDraft: () => !!ctx.state.logDraft,
+    /* Write the session to the device NOW and say what became of it — KEPT,
+       EMPTY (nothing logged yet) or LOST (there was work and the device
+       would not take it). view.js words its close notice from this. */
+    keepDraft,
+    reload: () => ctx.reload(),
+  };
+}
+
+/* Not a fresh vault and not a working one: Obsidian is still indexing, or a
+   read failed. Says which, and offers the one useful action. */
+function renderNotReady(ctx, root) {
+  const why = ctx.loadError
+    ? `Could not read the gym folder (${ctx.loadError}).`
+    : ctx.data && ctx.data.unreadable
+      /* Name the files. "3 files could not be read" gives the user nothing
+         to act on; the paths tell them whether it's one bad note or a sync
+         still landing. Cap the list so a mid-sync vault doesn't wall of text. */
+      ? `${ctx.data.unreadable} file${ctx.data.unreadable === 1 ? '' : 's'} could not be read yet`
+        + (ctx.data.unreadablePaths && ctx.data.unreadablePaths.length
+          ? `: ${ctx.data.unreadablePaths.slice(0, 3).join(', ')}${ctx.data.unreadablePaths.length > 3 ? ', …' : ''}.`
+          : '.')
+      : 'Your gym folder is there, but Obsidian has not finished indexing it.';
+  const card = el('div', { class: 'gv-setup' },
+    el('div', { class: 'gv-setup-logo' }, ico('history')),
+    el('h2', { class: 'gv-setup-title' }, 'Waiting for the vault'),
+    el('p', { class: 'gv-setup-sub' }, `${why} This usually clears itself in a few seconds — nothing is lost.`),
+    el('button', { class: 'gv-btn gv-btn-hero', type: 'button', onclick: () => ctx.reload() },
+      ico('repeat-2'), el('span', {}, 'Try again')));
+  root.append(card);
+}
+
+/* Empty vault — first-run setup card (silent adoption handles the existing-
+   data case before this ever shows; see data.present). */
+function renderSetup(ctx, root) {
+  const card = el('div', { class: 'gv-setup' },
+    el('div', { class: 'gv-setup-logo' }, ico('dumbbell')),
+    el('h2', { class: 'gv-setup-title' }, 'Set up your gym'),
+    el('p', { class: 'gv-setup-sub' },
+      `This creates plain markdown files under "${ctx.settings.gymFolder}/" — a starter exercise library, `,
+      'the Get Over The Bar plan, goals to chase, a profile and a body log. Everything stays in your vault.'),
+    /* The folder is already here but reads empty. Obsidian may be done
+       indexing while a sync is still downloading the vault to this device —
+       the app cannot tell that from "really empty", and Create would write
+       starter notes beside ones still on their way (duplicate copies). */
+    ctx.data && ctx.data.rootExists ? el('p', { class: 'gv-setup-sub' },
+      `"${ctx.settings.gymFolder}/" is already here but empty. If this vault is still syncing to this device, `,
+      'wait for that to finish first — creating files now can leave duplicate copies.') : null,
+    el('button', {
+      class: 'gv-btn gv-btn-hero', type: 'button',
+      onclick: async () => {
+        try {
+          await ctx.io.scaffold();
+          ctx.plugin.settings.onboarded = true;
+          await ctx.plugin.saveSettings();
+          await ctx.reload();
+          ctx.notice('Gym folder created. Let\'s train.');
+        } catch (e) { ctx.notice(`setup failed (${e.message || e})`); }
+      },
+    }, ico('play'), el('span', {}, 'Create my gym')));
+  root.append(card);
+}
+
+/* NAV is exported for the guard suite (tests/nav.test.cjs) and the preview
+   harness, which both need the real tab list rather than a copy of it — a
+   copied nav is a nav that silently stops matching the app. */
+module.exports = {
+  mountApp, NAV, paneHeightTier, SHORT_PANE_PX, SHORTER_PANE_PX, resolveDaysOn, isImplicitActive, describeDraft,
+  isPaused, parallelPlansOf, fallbackPlansOf, runPlanOf,
+};

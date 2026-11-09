@@ -1,0 +1,575 @@
+'use strict';
+/* DOM construction helpers — the only module under src/ (besides view,
+   modals, settings-tab) that imports obsidian. No innerHTML anywhere: every
+   node is built, which is both the community-review rule and what keeps
+   user-authored strings (exercise names, notes) inert. */
+
+const { setIcon } = require('obsidian');
+const { PAGE_TITLES } = require('./constants');
+
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, val] of Object.entries(attrs)) {
+    if (k === 'class') n.className = val;
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2), val);
+    else if (val !== null && val !== undefined) n.setAttribute(k, val);
+  }
+  /* Every plugin button opts OUT of Obsidian's own button chrome by carrying
+     .clickable-icon: app.css's `button:not(.clickable-icon)` sets gray
+     background/shadow at (0,1,1), and on MOBILE `button:not(.clickable-icon)
+     .mobile-tap` repaints a touched button gray at (0,2,1) — which beats our
+     (0,2,0) rules and flashes over the design mid-tap. Everything
+     .clickable-icon itself brings is (0,1,0/1) and loses to our rules; the
+     leftover gaps (radius, svg opacity) are patched in styles.css. */
+  if (tag === 'button') n.classList.add('clickable-icon');
+  for (const kid of kids.flat()) n.append(kid && kid.nodeType ? kid : document.createTextNode(kid ?? ''));
+  return n;
+};
+
+/* Lucide icon span. Names must exist in the app's pinned lucide set —
+   setIcon() on an unknown name is a SILENT no-op that ships an empty box.
+   Every name is checked against the DESKTOP obsidian.asar, but iOS often
+   runs an older app with an older lucide, where some of these names didn't
+   exist yet (lucide renamed whole families: line-chart→chart-line,
+   check-circle→circle-check…). So: try the name, then its older aliases,
+   then a neutral dot — never ship a blank box. */
+const ICON_FALLBACKS = {
+  'chart-line': ['line-chart'],
+  'circle-check': ['check-circle'],
+  'calendar-days': ['calendar'],
+  'clipboard-list': ['clipboard'],
+  'heart-pulse': ['heart'],
+  'medal': ['award'],
+  'timer': ['clock'],
+  'repeat-2': ['repeat'],
+};
+const ico = (name, cls) => {
+  const s = el('span', { class: `gv-ico${cls ? ' ' + cls : ''}` });
+  for (const candidate of [name, ...(ICON_FALLBACKS[name] || []), 'circle']) {
+    setIcon(s, candidate);
+    if (s.querySelector('svg')) break;
+  }
+  return s;
+};
+
+const clear = node => { while (node.firstChild) node.removeChild(node.firstChild); };
+
+/* A `<div>` that behaves like a button — the pattern every "the whole card
+   is the tap target" surface in this app needs, and (before this helper)
+   each one re-implemented by hand with no keyboard route at all. Wires
+   role="button" + tabindex="0", a click listener, and the same Enter/Space
+   handling attachTapZone uses for the tap-counter zones (rep-counter-
+   shared.js) — so a keyboard or switch-control user can reach it exactly
+   like a mouse/touch user can.
+
+   `onActivate(e)` fires on click and on Enter/Space, but NOT when the event
+   target is (or is inside) a nested <button> — cards that carry their own
+   edit/delete icon buttons must let those fire on their own, not double as
+   the card's own activation. Callers that used to write
+   `c.addEventListener('click', e => { if (!e.target.closest('button')) ... })`
+   by hand now get the same guard on both click AND keydown for free. */
+function clickableCard(attrs, onActivate, ...kids) {
+  const node = el('div', { ...attrs, role: attrs.role || 'button', tabindex: '0' }, ...kids);
+  const nested = e => !!e.target.closest('button');
+  node.addEventListener('click', e => { if (!nested(e)) onActivate(e); });
+  node.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (nested(e)) return;
+    e.preventDefault(); // ' ' must not also scroll the page
+    onActivate(e);
+  });
+  return node;
+}
+
+/* The opener to hand focus back to when a sheet closes: the control that was
+   passed in, else whatever held focus when the sheet opened (never <body>).
+   Call BEFORE moving focus into the sheet. */
+function focusOpener(explicit) {
+  if (explicit) return explicit;
+  const a = document.activeElement;
+  return a && a !== document.body ? a : null;
+}
+
+/* Give focus back to `opener` after `sheet` closed, so a keyboard user
+   resumes where they were instead of at the top of the page. Only when focus
+   is parked (on <body>, or still inside the closed sheet): a control used in
+   the sheet may have deliberately moved focus elsewhere (Type focuses the
+   count it edits) and that must not be stolen back. */
+function restoreFocus(sheet, opener) {
+  if (!opener || typeof opener.focus !== 'function' || opener.isConnected === false) return;
+  const a = document.activeElement;
+  const parked = !a || a === document.body || (sheet && typeof sheet.contains === 'function' && sheet.contains(a));
+  if (parked) opener.focus();
+}
+
+/* A labelled on/off row — the shape both the export options and the guided-
+   session setup screen need.
+
+   A switch, not a button: the row toggles one thing on/off rather than
+   activating an action, so it carries role="switch" + aria-checked. The
+   accessible name lives on the ROW (aria-label) because the row is the whole
+   hit target; the switch glyph itself is decorative. `onChange(next)` gets
+   the value it is being moved TO — callers re-render themselves, since this
+   module knows nothing about the app controller. `opts.label` is the
+   accessible name when the visible name is the STATE ("On Today" / "Paused"):
+   a switch whose name flips with its value reads as a contradiction.
+
+   `disabled` renders the row inert and unfocusable but still readable, for a
+   toggle that has nothing to act on (a warm-up with no mobility exercises in
+   the library). It carries its own explanation in `desc` — a dead control
+   with no reason given is worse than no control. */
+function toggleRow(name, desc, value, onChange, opts = {}) {
+  const on = !!value;
+  const cls = `gv-card gv-optrow${on ? ' on' : ''}${opts.disabled ? ' gv-optrow-off' : ''}`;
+  const body = [
+    el('div', { class: 'gv-optrow-main' },
+      el('div', { class: 'gv-optrow-name' }, name),
+      desc ? el('div', { class: 'gv-optrow-desc' }, desc) : ''),
+    el('span', { class: `gv-switch${on ? ' on' : ''}`, 'aria-hidden': 'true' }),
+  ];
+  if (opts.disabled) {
+    return el('div', { class: cls, 'aria-disabled': 'true' }, ...body);
+  }
+  return clickableCard(
+    { class: cls, role: 'switch', 'aria-checked': on ? 'true' : 'false', 'aria-label': opts.label || name },
+    () => onChange(!on),
+    ...body);
+}
+
+/* Display formatting for numbers that may be null ("no data" ≠ 0). */
+const fmt = (v, suffix) => (v === null || v === undefined || v === '' ? '—' : `${v}${suffix || ''}`);
+
+/* mm:ss for duration metrics (plank 360 → "6:00"). */
+const fmtSeconds = sec => {
+  const f = parseFloat(sec);
+  if (!Number.isFinite(f)) return '—';
+  /* Round ONCE, then split: rounding the seconds after the minute split read
+     119.6 as "1:60" and 59.5 as "60s". */
+  const n = Math.round(f);
+  if (n < 60) return `${n}s`;
+  const m = Math.floor(n / 60), s = n % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+};
+
+/* SVG progress ring, 0..1. Built with createElementNS (no innerHTML). */
+function ring(progress, size, label) {
+  const p = Math.max(0, Math.min(1, progress || 0));
+  const r = (size - 8) / 2;
+  const c = 2 * Math.PI * r;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  svg.setAttribute('class', 'gv-ring');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', label || `Progress ${Math.round(p * 100)}%`);
+  const mk = (cls, dash) => {
+    const ci = document.createElementNS(NS, 'circle');
+    ci.setAttribute('cx', size / 2); ci.setAttribute('cy', size / 2); ci.setAttribute('r', r);
+    ci.setAttribute('class', cls);
+    if (dash !== undefined) {
+      ci.setAttribute('stroke-dasharray', `${dash} ${c}`);
+      ci.setAttribute('transform', `rotate(-90 ${size / 2} ${size / 2})`);
+    }
+    svg.appendChild(ci);
+    return ci;
+  };
+  mk('gv-ring-track');
+  mk('gv-ring-fill', c * p);
+  const t = document.createElementNS(NS, 'text');
+  t.setAttribute('x', '50%'); t.setAttribute('y', '50%');
+  t.setAttribute('class', 'gv-ring-text');
+  t.textContent = `${Math.round(p * 100)}%`;
+  svg.appendChild(t);
+  return svg;
+}
+
+/* Sparkline for a [{date, value}] series. */
+function sparkline(points, w, h, label) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('class', 'gv-spark');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', label || 'Trend');
+  if (!points || points.length < 2) return svg;
+  const vals = points.map(p => p.value);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = max - min || 1;
+  const px = i => 4 + (i / (points.length - 1)) * (w - 8);
+  const py = val => h - 6 - ((val - min) / span) * (h - 12);
+  const d = points.map((p, i) => `${i ? 'L' : 'M'}${px(i).toFixed(1)},${py(p.value).toFixed(1)}`).join(' ');
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', d);
+  path.setAttribute('class', 'gv-spark-line');
+  svg.appendChild(path);
+  const last = document.createElementNS(NS, 'circle');
+  last.setAttribute('cx', px(points.length - 1)); last.setAttribute('cy', py(vals[vals.length - 1]));
+  last.setAttribute('r', 3); last.setAttribute('class', 'gv-spark-dot');
+  svg.appendChild(last);
+  return svg;
+}
+
+/* ---- Plan prose -------------------------------------------------------
+   Plan intros are long-form coaching copy. Rendering them as
+   `lines.join(' ')` flattened blank lines AND bullet lines into one
+   unbroken blob — 700 characters of undifferentiated text, which is what
+   "this copy is overwhelming" was reporting.
+
+   The shape here is a chunked accordion. Each blank-line-separated group
+   becomes a chunk with a permanently visible HEADLINE and a body that
+   collapses. That choice is deliberate and safety-driven: these intros
+   carry medical red flags ("stop and get assessed if you get: leaking
+   urine…", "get it looked at"). An earlier version classified paragraphs
+   as safety-critical by keyword and kept those expanded — but the matcher
+   demonstrably missed a real warning paragraph that never says "stop" or
+   "see a doctor". Hiding a red flag behind a button is a worse failure
+   than a wall of text, so nothing is classified: EVERY chunk's headline
+   stays on screen, and only the detail folds away. */
+
+/* Blank-line-separated groups, lines kept intact (bullets must survive). */
+const groups = lines => {
+  const out = [];
+  let cur = [];
+  for (const line of lines || []) {
+    if (String(line).trim() === '') { if (cur.length) { out.push(cur); cur = []; } }
+    else cur.push(String(line));
+  }
+  if (cur.length) out.push(cur);
+  return out;
+};
+
+/* Paragraph text per group — kept exported for the flattening tripwire. */
+const paragraphs = lines => groups(lines).map(g => g.map(l => l.trim()).join(' ').trim()).filter(Boolean);
+
+/* An ALL-CAPS lead-in ending in ":" or "." is this vault's headline
+   convention ("THE WEEK:", "PHASE 1 OF 4 — FOUNDATION.", "STOP AND GET
+   ASSESSED IF YOU GET:"). `[^a-z]` is the test: a lead-in has no lowercase. */
+/* A parenthetical may carry lowercase ("WHILE REBUILDING (to 11 Sep):")
+   without disqualifying the lead-in. */
+const LEAD_IN = /^([A-Z](?:[^a-z(]|\([^)]*\)){2,70}?[:.])(\s+|$)/;
+const UL = /^\s*[-*]\s+(.*)$/;
+const OL = /^\s*(\d+)[.)]\s+(.*)$/;
+
+/* One group → ordered blocks. Consecutive bullet lines coalesce into a real
+   list instead of being space-joined into the paragraph. */
+function blocksOf(lines) {
+  const blocks = [];
+  let para = [];
+  const flush = () => {
+    const text = para.join(' ').trim();
+    para = [];
+    if (text) blocks.push({ kind: 'p', text });
+  };
+  for (const raw of lines) {
+    const ul = raw.match(UL);
+    const ol = ul ? null : raw.match(OL);
+    if (ul || ol) {
+      flush();
+      const kind = ul ? 'ul' : 'ol';
+      const item = (ul ? ul[1] : ol[2]).trim();
+      const openList = blocks[blocks.length - 1];
+      if (openList && openList.kind === kind) openList.items.push(item);
+      else blocks.push({ kind, items: [item] });
+      continue;
+    }
+    /* Markdown lazy continuation: a plain line directly after a bullet
+       belongs to THAT bullet. Without this every wrapped bullet split its
+       list in two and dropped the tail into a stray paragraph. */
+    const prevBlock = blocks[blocks.length - 1];
+    if (!para.length && prevBlock && prevBlock.kind !== 'p') {
+      prevBlock.items[prevBlock.items.length - 1] += ` ${raw.trim()}`;
+      continue;
+    }
+    para.push(raw.trim());
+  }
+  flush();
+  return blocks;
+}
+
+/* The headline for a chunk that has no caps lead-in. It must read as a
+   thought, not a truncation: if the FIRST SENTENCE is short enough it is the
+   headline whole; otherwise it stops at a word boundary at the word limit,
+   dropping any comma/dash left dangling before the ellipsis. A sentence gets
+   two words of allowance over the limit (SENTENCE_WORDS) so a ten-word
+   sentence is finished rather than cut at eight. */
+const HEADLINE_WORDS = 8;
+const SENTENCE_WORDS = 10;
+const ABBREVIATION = /^(?:e\.g|i\.e|vs)\.$/i;
+function firstSentence(text) {
+  const end = /[.!?]+(?=\s|$)/g;
+  let m;
+  while ((m = end.exec(text))) {
+    const head = text.slice(0, m.index + m[0].length);
+    /* "e.g." and "vs." are not sentence ends. A decimal point never matches:
+       the lookahead needs whitespace or the end right after it. */
+    if (ABBREVIATION.test(head.split(/\s+/).pop())) continue;
+    return head;
+  }
+  return text;
+}
+const words = text => {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  const sentence = firstSentence(flat);
+  const w = sentence.split(' ').filter(Boolean);
+  if (w.length <= SENTENCE_WORDS) return sentence;
+  return `${w.slice(0, HEADLINE_WORDS).join(' ').replace(/[\s,;:\u2013\u2014-]+$/, '')}…`;
+};
+
+/* Groups → [{label, blocks}]. A group that is ONLY a lead-in adopts the
+   next group as its body, so "THE RULES FOR THESE TWO WEEKS:" followed by
+   a bullet list reads as one chunk rather than an empty header. */
+function chunks(lines) {
+  const raw = groups(lines).map(g => {
+    const blocks = blocksOf(g);
+    let label = '';
+    const first = blocks[0];
+    if (first && first.kind === 'p') {
+      const m = first.text.match(LEAD_IN);
+      if (m) {
+        label = m[1].trim();
+        const rest = first.text.slice(m[0].length).trim();
+        if (rest) first.text = rest;
+        else blocks.shift();
+      }
+    }
+    return { label, blocks };
+  }).filter(c => c.label || c.blocks.length);
+
+  const out = [];
+  for (const c of raw) {
+    const prev = out[out.length - 1];
+    /* A group that is only a lead-in adopts the next group as its body. */
+    if (prev && prev.label && !prev.blocks.length) { prev.blocks = c.blocks; continue; }
+    /* A bare list is never its own topic — it continues whatever introduced
+       it. Left alone, "THE RETURN-TO-RUNNING CHECKS." became a chunk with no
+       checks in it, and the checks became a chunk headlined by their own
+       first item. */
+    if (prev && !c.label && c.blocks.length && c.blocks.every(b => b.kind !== 'p')) {
+      prev.blocks = prev.blocks.concat(c.blocks);
+      continue;
+    }
+    out.push(c);
+  }
+  /* Unlabelled chunks still need a visible headline, so summarise them —
+     that is what keeps a warning with no caps lead-in ("Leaking or dragging
+     during a run…") on screen. A DERIVED headline is a sentence opening, not
+     a section title, so it is flagged and presented differently. */
+  for (const c of out) {
+    if (c.label) continue;
+    const p = c.blocks.find(b => b.kind === 'p');
+    const src = p ? p.text : (c.blocks[0] && c.blocks[0].items[0]) || '';
+    c.label = words(src);
+    c.derived = true;
+  }
+  return out;
+}
+
+let proseUid = 0;
+
+function renderBlocks(host, blocks) {
+  for (const b of blocks) {
+    if (b.kind === 'p') { host.append(el('p', {}, b.text)); continue; }
+    const list = el(b.kind === 'ol' ? 'ol' : 'ul', { class: 'gv-prose-list' });
+    for (const item of b.items) list.append(el('li', {}, item));
+    host.append(list);
+  }
+}
+
+/* Chunked prose. The first chunk is open; the rest show their headline with
+   a disclosure control. Bodies are in the DOM throughout — collapsing is
+   visual only, so find-in-page and screen readers still reach every word. */
+function prose(lines, opts = {}) {
+  const list = chunks(lines);
+  const wrap = el('div', { class: `gv-prose${opts.class ? ' ' + opts.class : ''}` });
+  if (!list.length) return wrap;
+
+  /* A single chunk is just prose — no accordion chrome for one paragraph. */
+  if (list.length === 1) {
+    const only = list[0];
+    if (only.blocks.length) renderBlocks(wrap, only.blocks);
+    else wrap.append(el('p', {}, only.label));
+    return wrap;
+  }
+
+  /* EVERY chunk starts closed. Leaving the first one open still opened the
+     page on a seven-line paragraph, which is what "still too long for the
+     intro" was reporting — so the intro is now a compact stack of headlines
+     and the reader opens the one they want. */
+  list.forEach(c => {
+    const id = `gv-prose-${++proseUid}`;
+    const body = el('div', { class: 'gv-chunk-body', id });
+    renderBlocks(body, c.blocks);
+    const chunk = el('div', { class: 'gv-chunk' });
+    const btn = el('button', { class: 'gv-chunk-head', type: 'button', 'aria-controls': id });
+    btn.append(el('span', { class: `gv-chunk-label${c.derived ? ' is-summary' : ''}` }, c.label), ico('chevron-down', 'gv-chunk-caret'));
+    /* State lives in a class, never in an inline style: Obsidian's review
+       guidelines ask plugins not to assign styles from JS, and it keeps the
+       open/closed look in the stylesheet where a theme can reach it. */
+    let shown = false;
+    const apply = () => {
+      chunk.className = `gv-chunk${shown ? ' open' : ''}`;
+      btn.setAttribute('aria-expanded', shown ? 'true' : 'false');
+    };
+    btn.addEventListener('click', () => { shown = !shown; apply(); });
+    chunk.append(btn, body);
+    apply();
+    wrap.append(chunk);
+  });
+  return wrap;
+}
+
+
+/* A small segmented picker: one row of buttons, exactly one pressed. Used by
+   the counters' sensitivity control, where a dropdown would be the wrong
+   shape entirely — the thing is operated mid-set, at arm's length, by someone
+   who wants to see all three choices and the current one at a glance.
+
+   `options` is [[value, label], …]; `onPick(value)` fires only when the
+   selection actually CHANGES, so a caller can restart an expensive
+   subscription in it without guarding against a no-op re-tap. */
+function segmented(options, current, onPick, opts) {
+  const o = opts || {};
+  const wrap = el('div', { class: `gv-segmented${o.class ? ' ' + o.class : ''}`, role: 'radiogroup' },
+    ...(o.label ? [el('span', { class: 'gv-segmented-label' }, o.label)] : []));
+  for (const [value, label] of options) {
+    const on = value === current;
+    const b = el('button', {
+      class: `gv-segmented-btn${on ? ' on' : ''}`, type: 'button',
+      role: 'radio', 'aria-checked': on ? 'true' : 'false',
+    }, label);
+    b.addEventListener('click', () => { if (value !== current) onPick(value); });
+    wrap.append(b);
+  }
+  return wrap;
+}
+
+/* NUMBERS YOU CAN ACTUALLY TYPE.
+
+   Every logged figure used `<input type="number">` with inputmode:'decimal'.
+   Two things were wrong with that, and both ended with a figure the user
+   entered not being there:
+
+     - type="number" defaults to step="1", so 4.3 is INVALID. inputmode only
+       chooses the on-screen keyboard; it says nothing about what the field
+       will hold.
+     - type="number" accepts exactly one decimal separator, the period, no
+       matter what the device's locale uses. Typing "4,3" leaves `.value` as
+       an EMPTY STRING — the distance did not come out wrong, it vanished.
+       That is how a comma-decimal locale writes it, South Africa included.
+
+   So these are TEXT inputs with inputmode:'decimal' — the same keypad on a
+   phone, none of the silent discarding — and the value is normalised here.
+   Text means the field will hold anything, so this is also what stops it:
+   buildRows writes the box's contents straight into the note's table, and
+   "abc km" must never get that far.
+
+   EVERY FIELD TAKES A DECIMAL, including reps and seconds. A first attempt
+   made those two whole-number and it was worse than the bug: keystrokes
+   arrive one at a time, so "12.5" reached the field as "12", "12." and then
+   "125" — the separator was dropped as it was typed and the digits joined.
+   A count that silently becomes ten times itself is far worse than one that
+   records a half. If someone types half a rep, they meant it.
+
+   normaliseNumber is exported and pure, because what a training log is
+   allowed to record is a rule, not a rendering detail.
+
+   NO MINUS SIGN. Every field this feeds (0.11.2 journey audit, finding
+   L10: weight_kg, distance_km, minutes, seconds, reps — every numericInput()
+   call site in the plugin, checked) is a physical quantity that is never
+   meaningful negative. A leading "-" used to be PLACED rather than policed,
+   so "-5" reps or "-2.5" kg round-tripped straight into the note's table as
+   a real, unflagged figure. It is dropped here, the same way a stray second
+   decimal point is dropped rather than rejected — keeping the digits the
+   user typed beats emptying the field mid-edit. If a field genuinely needs a
+   sign one day (nothing today does), that is a clamp at ITS OWN call site,
+   not a reason to bring the minus back here — this helper is shared by
+   every numeric field in the app. */
+function normaliseNumber(raw) {
+  /* A phone keyboard set to Arabic, Persian or a full-width IME types digits
+     that are not [0-9]; they used to be erased as junk. Map them to ASCII
+     first (U+0660-0669, U+06F0-06F9, U+FF10-FF19), and the Arabic decimal
+     separator (U+066B) and full-width full stop (U+FF0E) to the point. */
+  let v = String(raw == null ? '' : raw)
+    .replace(/[\u0660-\u0669]/g, c => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, c => String(c.charCodeAt(0) - 0x06F0))
+    .replace(/[\uFF10-\uFF19]/g, c => String(c.charCodeAt(0) - 0xFF10))
+    .replace(/[\u066B\uFF0E]/g, '.');
+  v = v.replace(/[^0-9.,]/g, '');
+  /* A comma IS a decimal point here. */
+  v = v.replace(/,/g, '.');
+  const i = v.indexOf('.');
+  /* One point. A second separator is a slip — dropping it keeps the digits
+     the user typed, which beats emptying a field mid-edit. */
+  if (i !== -1) v = v.slice(0, i + 1) + v.slice(i + 1).replace(/\./g, '');
+  return v;
+}
+
+/* A logging field. onValue receives the normalised string on every edit. */
+function numericInput(attrs, onValue) {
+  const input = el('input', {
+    ...attrs,
+    type: 'text',
+    /* 'decimal' shows a keypad WITH a separator — the difference between
+       being able to type 4.3 on a phone and not. */
+    inputmode: 'decimal',
+    /* A measurement is not a word: no autocorrect, no capitalisation. */
+    autocomplete: 'off', autocorrect: 'off', spellcheck: 'false',
+  });
+  input.addEventListener('input', () => {
+    const clean = normaliseNumber(input.value);
+    if (clean !== input.value) {
+      /* Rewriting the value moves the caret to the end, which is wrong in
+         the middle of an edit. Put it back where it was, less whatever the
+         normalisation removed before it. */
+      const at = input.selectionStart;
+      const removed = input.value.length - clean.length;
+      input.value = clean;
+      if (at !== null && input.setSelectionRange) {
+        const to = Math.max(0, at - removed);
+        try { input.setSelectionRange(to, to); } catch (e) { /* not a text field yet */ }
+      }
+    }
+    if (onValue) onValue(input.value);
+  });
+  return input;
+}
+
+/* THE BACK BUTTON EVERY NESTED PAGE SHARES.
+
+   These used to hardcode their destination — Running records always went to
+   Running, exercise detail always to the Exercises library — so Records ->
+   Running records -> Back landed on Running rather than Records, and an
+   exercise opened from a record dropped you in a library you had never been
+   in. ctx.back() consults the route stack instead; `fallback` is where to go
+   on a first visit, when nothing called you.
+
+   The label NAMES the destination rather than saying a bare "Back", because
+   it now varies with how you arrived, and "Back" alone tells a screen-reader
+   user nothing about where they are about to land. */
+function backButton(ctx, fallback) {
+  const to = ctx.backTo(fallback);
+  const b = el('button', {
+    class: 'gv-icon-btn', type: 'button',
+    'aria-label': `Back to ${PAGE_TITLES[to] || to}`,
+  }, ico('arrow-left'));
+  b.addEventListener('click', () => ctx.back(fallback));
+  return b;
+}
+
+/* The stat tile Today, Running, Profile, Exercise detail, Run records and the
+   completion screen all build: icon, big figure, label. `extraClass` is Today's
+   one variant (a tile that needs its own hook). tests/dom-shared-builders.test.cjs
+   pins the DOM this produces against the markup each page used to write inline. */
+function statTile(icon, big, label, extraClass) {
+  return el('div', { class: `gv-tile${extraClass ? ` ${extraClass}` : ''}` },
+    el('div', { class: 'gv-tile-ico' }, icon),
+    el('div', { class: 'gv-tile-big' }, big),
+    el('div', { class: 'gv-tile-label' }, label));
+}
+
+/* The one-line empty state every page uses. */
+const emptyLine = (...kids) => el('div', { class: 'gv-empty-line' }, ...kids);
+
+module.exports = {
+  backButton, numericInput, normaliseNumber, el, ico, clickableCard, focusOpener, restoreFocus, toggleRow, clear, fmt, fmtSeconds, ring, sparkline, paragraphs, chunks, prose, segmented, statTile, emptyLine
+};

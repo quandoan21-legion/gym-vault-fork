@@ -1,0 +1,2550 @@
+'use strict';
+/* Guided session — a SECOND RENDERER over the same draft src/page-log.js
+   edits (ONE DRAFT, TWO VIEWS). Completing a set here writes into the exact
+   same draft.entries[i].sets[j] object the overview shows; nothing here ever
+   creates draft state of its own, and switching to the overview mid-session
+   (via the exit button, or the persistent nav bar) is lossless in both
+   directions — Finish still goes through page-log.js's finishSession.
+
+   Navigation position is a pure step machine (session-flow.js); this module
+   owns rendering, the embedded tap-counter / hold-timer / weight+distance
+   inputs, and the side effects (wake lock, speech, confetti) that go with
+   them. Ephemeral UI state (position, phase, per-set counter/timer, mute,
+   record/goal tallies) lives on ctx.state.session — a fresh object every
+   time guided mode is (re-)entered via ctx.enterGuided(). */
+
+const { Notice } = require('obsidian');
+const { el, ico, clear, fmtSeconds, segmented, numericInput, statTile } = require('./dom');
+const { todayISO } = require('./dates');
+const { DEFAULT_SETTINGS, GUIDE_REST } = require('./constants');
+const { setCounts, goalCurrent, goalProgress, sameName } = require('./stats');
+const flow = require('./session-flow');
+const records = require('./records');
+const confetti = require('./confetti');
+const { createCounter, tap, undo, DEBOUNCE_MS } = require('./rep-counter');
+const { holdWakeLock, attachTapZone, attachCountIn, attachFillMeter, attachPowerUp, punch, typeCountButton } = require('./rep-counter-shared');
+const counterTarget = require('./counter-target');
+const { helpButton } = require('./explainer');
+const { counterSettingsButton } = require('./counter-settings');
+const sound = require('./sound');
+const countdown = require('./countdown');
+const { motionAvailable, startMotionCounter } = require('./motion-source');
+const { sensitivityKey, motionKey, motionPref, initialMotion, chooseMotion, motionFailureCopy } = require('./motion-count');
+const { resolveExerciseImages } = require('./page-exercise-detail');
+const pageLog = require('./page-log');
+const { buildRows, finishSession, keepDraft, saveMotionPref } = pageLog;
+const { EndSessionModal } = require('./modals');
+const { nextFrameIndex, autoPlayMedia, MEDIA_CYCLE_MS } = require('./media-cycle');
+const { openMediaViewer } = require('./media-viewer');
+const { mountMuscleMap, canDraw } = require('./muscle-map');
+const { motionFor, noteSteps, visualPrefs, rememberDetail } = require('./motion-library');
+const { musicButton } = require('./music-picker');
+const timedPlan = require('./timed-plan');
+const timerState = require('./timer-state');
+const { classifyKind, liveBest, pbTarget, pbDelta, marginText, pctText } = require('./progress');
+const chrome = require('./live-chrome');
+
+const FLASH_MS = 180;
+const HOLD_CHECKPOINT_S = 15;
+/* Most notes hold a start/finish pair, so 2 was the whole animation. Notes
+   sourced from a real photo SEQUENCE (the burpee and the kettlebell front
+   squat carry four frames each) animate properly at 4 — and a note with two
+   frames is unchanged, because slice() takes what is there. Beyond four the
+   cycle outlasts a working set and starts reading as a slideshow. */
+const MEDIA_MAX_FRAMES = 4;
+/* The poster skins' weight stepper moves in the smallest plate that exists. */
+const WEIGHT_STEP_KG = 2.5;
+
+/* WHAT A LIVE SET HAS OBSERVED. The tap counter watches reps and the hold's
+   stopwatch watches seconds — see applyCompletion for what the list means and
+   why it is a list. Named once because there are now two ways a live figure
+   reaches applyCompletion (the Done button, and commitLiveSet when the session
+   is ended with a set still on screen) and they must claim exactly the same
+   thing: a second copy of this rule is how the trust seam would drift. */
+const OBSERVED_REPS = Object.freeze({ observed: Object.freeze(['reps']) });
+const OBSERVED_SECONDS = Object.freeze({ observed: Object.freeze(['seconds']) });
+/* A hold that was out of sight while it ran was not WATCHED (see watchAway). */
+const OBSERVED_NOTHING = Object.freeze({ observed: Object.freeze([]) });
+const heldObserved = hold => (hold && hold.away ? OBSERVED_NOTHING : OBSERVED_SECONDS);
+
+function render(ctx, root) {
+  const draft = ctx.state.logDraft;
+  if (!draft) { ctx.nav('dashboard'); return; }
+
+  if (!ctx.state.session) {
+    /* THE HANDOFF FROM LAST TIME THIS PAGE WAS OPEN (0.11.2 journey audit,
+       finding L9). pageCleanup stashes the outgoing session's tally here,
+       tied to the draft it was earned against — consumed exactly once, and
+       only for THAT SAME draft, so a genuinely new draft (a fresh Start
+       after Finish or Discard, both of which null ctx.state.logDraft before
+       navigating away) never inherits a stale total just because one
+       happened to still be sitting on ctx.state. */
+    const carry = ctx.state.sessionCarry;
+    const carryMatches = !!carry && carry.draft === draft;
+    ctx.state.sessionCarry = null;
+    /* THE OTHER WAY BACK: a session restored from the device after iOS evicted
+       the app (audit C-05 + R2-04). There is no carry then, but the draft came
+       back with its `live` block (draft-store.js), so the same fields are read
+       from that. Either way `tally` is plain data of one shape. */
+    const tally = carryMatches ? carry : restoredTally(draft);
+    ctx.state.session = {
+      pos: flow.initialPosition(draft),
+      phase: 'active',
+      pendingPos: null,
+      /* The rest's clock (timer-state.js): null outside a rest. A clock
+         rather than a bare start stamp so the rest can be paused. */
+      rest: null,
+      muted: false,
+      counter: null, counterFor: null,
+      /* Motion counting is per-SESSION, not per-render: the toggle must
+         survive the re-render that every completed set causes. stopMotion is
+         the live subscription's teardown, replaced on each render.
+
+         And it is per EXERCISE: motionOn is only what the exercise on screen
+         is doing right now. What the user chose, and for which exercise,
+         lives in motionChoices (see initialMotion), and each exercise's note
+         remembers it across sessions as `motion_counting`. motionHint is the
+         soft line shown when a remembered start could not begin. */
+      motionOn: false, motionChoices: {}, motionKey: '', motionHint: '', stopMotion: null, motionStart: null,
+      hold: null, holdFor: null,
+      workoutsAtStart: ctx.data.workouts, // snapshot: never includes THIS session's own rows (they aren't saved until Finish)
+      metGoals: tally.metGoals,
+      /* [{key, exercise, kind, val, prev}] — every best broken this session,
+         with what it beat.
+
+         sess.records IS the count — there is no separate recordCount. There
+         was, and it incremented on every record INCLUDING beating the same
+         best twice in one session, which sess.records deliberately collapses
+         into one row. Two figures derived by different rules, in the same
+         object, three lines apart. */
+      records: tally.records,
+      goalCount: tally.goalCount,
+      confettiStop: null,
+      completionCelebrated: false,
+      mediaCycleTimer: null,
+      stopMuscleMap: null,
+      /* Timed mode only (draft.timed holds the schedule). `index` walks the
+         interval list; the clock is kept as a start stamp plus the seconds
+         banked before the last pause, so a pause is exact rather than
+         drifting by however long the tick happened to be. */
+      timed: draft.timed ? Object.assign({
+        index: timedPlan.initialIndex(draft.timed, draft, flow.isSettled),
+        spokenAt: null,
+        announcedFor: null,
+      }, timerState.startClock(Date.now())) : null,
+    };
+    /* A clock that was PAUSED when the user left comes back paused, at the
+       same value. A running one is not carried: it starts over, as it always
+       did. */
+    restorePaused(ctx.state.session, draft, tally.paused);
+    watchAway(ctx.state.session, root);
+  }
+  const sess = ctx.state.session;
+  /* The draft's own copy of the tally and any pause, kept in step from here on
+     (see syncLive) so the next device-local write carries them. */
+  syncLive(draft, sess);
+
+  /* The media-cycle timer (guidedImageBlock, below) is deliberately NOT
+     ctx.setPageInterval — that single slot belongs to the hold-timer / rest
+     stopwatch, and a duration exercise can have both a running hold AND a
+     cycling image live at once. Every full render rebuilds the frame DOM
+     from scratch (renderActive is called fresh on each position change), so
+     any interval from the PREVIOUS render must die here before this render
+     creates its own (or none) — otherwise it keeps ticking against detached
+     nodes and a second one stacks on top of it next render. */
+  if (sess.mediaCycleTimer) { window.clearInterval(sess.mediaCycleTimer); sess.mediaCycleTimer = null; }
+  /* THE COUNT-IN DIES WITH ITS SCREEN (audit L3-03). Done, Skip, a nav to Rest
+     or to the completion screen all re-render without ever reaching the
+     counter that owns the count-in, so the old sequencer kept ticking against
+     detached nodes: it spoke "3, 2, 1, Begin" over Rest and then threw from its
+     own timer (the set's counter was gone). Every full render starts by
+     stopping it. A render that is still ON a set whose count has not finished
+     (a vault sync landing mid-gate) builds a fresh one below, resuming from
+     sess.countInStartedAt, exactly as it already did. */
+  if (sess.stopCountIn) { sess.stopCountIn(); sess.stopCountIn = null; }
+  /* The Muscle Map's animation loop, same rule: the thumbnail it draws into is
+     rebuilt by every render, so the previous loop stops here, exactly once,
+     before this render mounts its own (or none). The map also ends itself the
+     first frame after its DOM is detached; this is what makes the teardown
+     certain rather than one frame late. */
+  if (sess.stopMuscleMap) { sess.stopMuscleMap(); sess.stopMuscleMap = null; }
+
+  /* The motion subscription is on `window`, not the DOM, so nothing tears
+     it down on its own the way a detached tap zone would. Every full render
+     rebuilds renderActive's body from scratch (same as the media-cycle timer
+     above), so the PREVIOUS render's subscription has to die here, right
+     next to it, or it outlives its own DOM: it keeps closing over a detached
+     count element and an already-armed count-in, and during rest (where
+     sess.counter is null) every sample it still delivers calls tap(null) and
+     throws. motionButton's own re-subscribe branch below only fires when
+     sess.stopMotion is null, so clearing it here — not there — is what makes
+     that branch actually run again with a live closure. */
+  if (sess.stopMotion) { sess.stopMotion(); sess.stopMotion = null; }
+
+  ctx.state.pageCleanup = () => {
+    if (sess.wakeLock) { sess.wakeLock.release(); sess.wakeLock = null; }
+    if (sess.confettiStop) { sess.confettiStop(); sess.confettiStop = null; }
+    if (sess.mediaCycleTimer) { window.clearInterval(sess.mediaCycleTimer); sess.mediaCycleTimer = null; }
+    if (sess.stopMuscleMap) { sess.stopMuscleMap(); sess.stopMuscleMap = null; }
+    if (sess.stopCountIn) { sess.stopCountIn(); sess.stopCountIn = null; }
+    if (sess.stopMotion) { sess.stopMotion(); sess.stopMotion = null; }
+    if (sess.stopAwayWatch) { sess.stopAwayWatch(); sess.stopAwayWatch = null; }
+    sound.cancel();
+    /* THE TALLY OUTLIVES THE PAGE; THE POSITION DOES NOT (0.11.2 journey
+       audit, finding L9). Leaving this page for ANY reason — the review
+       exit, a nav-bar tap, Finish, Discard — used to throw the whole
+       session object away with it, records/goalCount included, so a record
+       broken before "Review in log" vanished from the completion screen the
+       moment Guided reopened it. Stashed here rather than dropped, and tied
+       to the DRAFT it belongs to rather than a bare flag: Finish and
+       Discard both null ctx.state.logDraft before they navigate away (see
+       page-log.js's finishSession and the EndSessionModal's onDiscard), so
+       a stash captured here for either of them carries a null draft and
+       will never match a later, genuinely new one. render()'s own fresh-
+       session branch is the other half — it only ever applies this for the
+       SAME draft, and only once. */
+    ctx.state.sessionCarry = { draft: ctx.state.logDraft, records: sess.records, goalCount: sess.goalCount, metGoals: sess.metGoals, paused: pausedSnapshot(sess) };
+    syncLive(ctx.state.logDraft, sess);
+    ctx.state.session = null;
+  };
+  if (!sess.wakeLock) sess.wakeLock = holdWakeLock();
+
+  /* One wrapping container per render — lets styles.css lay the phase out as
+     a flex column (the tap zone flexes to fill whatever's left of the
+     viewport) and gives the bottom controls a single, phase-independent
+     place to clear Obsidian mobile's floating navbar from, instead of
+     chasing every phase's own last element. */
+  const page = el('div', { class: 'gv-session-page' });
+  root.append(page);
+
+  /* Timed mode is a THIRD renderer over the same draft, not a different
+     session: it walks an interval schedule instead of the set-by-set step
+     machine, but every completed interval writes into the same
+     draft.entries[i].sets[j] object, and Finish is still page-log's. */
+  if (draft.timed && sess.timed) { renderTimed(ctx, page, draft, sess); return; }
+
+  if (flow.isDone(draft, sess.pos)) { renderComplete(ctx, page, draft, sess); return; }
+  if (sess.phase === 'resting') { renderRest(ctx, page, draft, sess); return; }
+  renderActive(ctx, page, draft, sess);
+}
+
+/* ---------- shared chrome ---------- */
+
+function progressBar(draft) {
+  const { done, total } = flow.progress(draft);
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  return el('div', { class: 'gv-bar gv-session-bar' }, el('div', { class: 'gv-bar-fill', style: `width:${pct}%` }));
+}
+
+/* THE SET ON SCREEN IS PART OF THE SESSION (0.12.1, audit L3-02). With twelve
+   taps on the counter and no Done yet, "Bank it" saved the sets already ticked
+   and silently dropped the twelve; "Back to the log" left an empty set behind;
+   a hold that was running (a 50-second plank) saved nothing. What the user was
+   looking at is not what landed.
+
+   So the two exits that KEEP the work commit the live figure first, through
+   applyCompletion with the same observed kind the Done button uses — the tap
+   count observed reps, a running stopwatch observed seconds. Nothing new about
+   what may claim a record. "Keep going" never reaches this (it only closes the
+   sheet) and Discard must not: both leave the live set exactly as it was.
+
+   Only the set-by-set screen has a live set. A hold still in its count-in has
+   not started, an empty counter has nothing, a run's km and minutes are
+   written into the set as they are typed, and a timed interval completes only
+   when its clock does — none of those commit anything. Returns whether it
+   committed. */
+function commitLiveSet(ctx, draft) {
+  const sess = ctx.state.session;
+  if (!sess || sess.phase !== 'active' || (draft.timed && sess.timed)) return false;
+  const cur = flow.currentSet(draft, sess.pos);
+  if (!cur) return false;
+  const { entry, set } = cur;
+  const key = setKey(sess.pos);
+  if (entry.distance) return false;
+  if (entry.duration) {
+    const hold = sess.hold;
+    if (!hold || sess.holdFor !== key || !hold.running) return false;
+    const secs = Math.round(heldSeconds(hold));
+    if (secs <= 0) return false;
+    hold.running = false;
+    hold.paused = false;
+    hold.frozenSeconds = secs;
+    applyCompletion(ctx, draft, sess, set, entry, { seconds: String(secs) }, heldObserved(hold));
+    return true;
+  }
+  const counter = sess.counter;
+  if (!counter || sess.counterFor !== key || !(counter.count > 0)) return false;
+  applyCompletion(ctx, draft, sess, set, entry, { reps: String(counter.count) }, OBSERVED_REPS);
+  return true;
+}
+
+/* The one sheet both ways out of a session go through. X used to nav
+   straight to the overview, which made the ONLY exit from the live screen an
+   icon that reads as cancel — and the save then hid behind "Bank it" under
+   the overview's discard-flavoured chrome. Now X asks, and names the save.
+   `review` keeps the old behaviour available as one of the three answers. */
+function endSession(ctx, draft, { review } = {}) {
+  new EndSessionModal(ctx.app, {
+    onSave: () => { commitLiveSet(ctx, draft); return finishSession(ctx, draft); },
+    onDiscard: () => { ctx.state.logDraft = null; ctx.nav('dashboard'); },
+    onReview: review ? () => { commitLiveSet(ctx, draft); ctx.nav('log'); } : null,
+  }).open();
+}
+
+function exitButton(ctx, draft) {
+  const b = el('button', { class: 'gv-icon-btn', type: 'button', 'aria-label': 'End session' }, ico('x'));
+  b.addEventListener('click', () => endSession(ctx, draft, { review: true }));
+  return b;
+}
+
+/* Jump out to change the song (or start a saved playlist), then back — shown
+   in BOTH active and resting phases, since music changes happen mostly
+   during rest but gating it there would only make it harder to find
+   mid-set. The button and its menu live in music-picker.js so the setup
+   screen offers exactly the same list. */
+
+function topBar(ctx, draft, extra) {
+  return el('div', { class: 'gv-session-top' },
+    el('div', { class: 'gv-session-top-row' }, exitButton(ctx, draft), extra || '', musicButton(ctx) || ''),
+    progressBar(draft));
+}
+
+function resetActiveState(sess) {
+  sess.counter = null; sess.counterFor = null;
+  sess.hold = null; sess.holdFor = null;
+  /* countedIn is NOT cleared here. It is keyed by position, and every caller
+     of this function is moving to a DIFFERENT position — so the key stops
+     matching on its own, and the next set counts in. Clearing it as well
+     would be harmless today and wrong the first time something resets state
+     without moving. */
+}
+
+function setKey(pos) { return `${pos.entryIndex}:${pos.setIndex}`; }
+
+/* ---------- pausing a clock ----------
+
+   Three screens run a clock a user may need to stop (the hold, the rest and
+   the timed circuit's interval). They share one rule for what a pause does to
+   the clock — src/timer-state.js — and one look for the control, below: the
+   circuit's own play/pause button, so every skin already styles it. */
+
+/* The rest's "Paused" line sits UNDER its button and is never removed, only
+   blanked with a non-breaking space: an empty line would collapse, and the
+   screen would jump the moment the button was pressed (and a second tap at the
+   same spot would land on whatever slid under the thumb). The hold's line is
+   inside its zone and the circuit's inside its ring, where nothing can move. */
+const PAUSE_LINE_BLANK = '\u00a0';
+
+/* The circuit's button. Built here so the hold and the rest wear exactly the
+   same one: class, size, icon and the Pause/Resume label. */
+function playButton(paused) {
+  return el('button', {
+    class: 'gv-timed-play', type: 'button',
+    'aria-label': paused ? 'Resume' : 'Pause',
+  }, ico(paused ? 'play' : 'pause'));
+}
+
+/* Flip the same button in place (the hold and the rest update without
+   re-rendering, so keyboard focus stays on the control that was pressed). */
+function syncPlayButton(btn, paused) {
+  btn.setAttribute('aria-label', paused ? 'Resume' : 'Pause');
+  clear(btn);
+  btn.append(ico(paused ? 'play' : 'pause'));
+}
+
+/* A HOLD THAT WAS OUT OF SIGHT WAS NOT OBSERVED (audit B-hold-away). The
+   stopwatch is wall-clock time, so a plank started and then forgotten while the
+   app sat in the background (the Music button, a call, a locked phone) read an
+   hour on return, and stopping it announced a NEW BEST. A RUNNING hold that is
+   out of sight for longer than AWAY_GRACE_MS is flagged `away`; its seconds are
+   still saved, but it completes with observed: [] and so claims no record
+   (heldObserved). The grace is for the glance: skipping a song in the music app
+   mid-plank is still a plank the user was watching, and costing a PB for it
+   would punish the Music button this screen offers. A hold that was paused when
+   the page was hidden is not flagged: a paused clock cannot run away. One
+   listener per session, removed by pageCleanup. */
+const AWAY_GRACE_MS = 15000;
+function watchAway(sess, root) {
+  const doc = (root && root.ownerDocument) || (typeof document !== 'undefined' ? document : null);
+  if (!doc || typeof doc.addEventListener !== 'function') return;
+  const onChange = () => {
+    const h = sess.hold;
+    if (!h) return;
+    if (doc.visibilityState === 'hidden') {
+      if (h.running && !h.paused) h.hiddenAt = Date.now();
+      return;
+    }
+    if (h.hiddenAt != null && Date.now() - h.hiddenAt > AWAY_GRACE_MS) h.away = true;
+    h.hiddenAt = null;
+  };
+  doc.addEventListener('visibilitychange', onChange);
+  sess.stopAwayWatch = () => doc.removeEventListener('visibilitychange', onChange);
+}
+
+/* WHAT A PAUSE LEAVES BEHIND WHEN THE USER LEAVES THE SESSION. pageCleanup
+   throws the session object away (see its comment), which would turn a paused
+   plank back into a fresh count-in — the one moment the pause exists to
+   protect. So a PAUSED clock is stashed beside the tally and put back by
+   restorePaused. A RUNNING clock is deliberately not carried: leaving with
+   one running already meant starting over, and that is not changed here.
+
+   Null when nothing is paused. */
+function pausedSnapshot(sess) {
+  const tp = sess.timed;
+  if (tp) {
+    return tp.paused
+      ? { kind: 'timed', index: tp.index, bankedSeconds: tp.bankedSeconds, spokenAt: tp.spokenAt, announcedFor: tp.announcedFor }
+      : null;
+  }
+  if (sess.phase === 'resting' && sess.rest && sess.rest.paused && sess.pendingPos) {
+    return { kind: 'rest', next: setKey(sess.pendingPos), bankedSeconds: sess.rest.bankedSeconds, callouts: (sess.pendingCallouts || []).slice() };
+  }
+  const h = sess.hold;
+  if (sess.phase === 'active' && h && h.running && h.paused && sess.holdFor) {
+    return { kind: 'hold', key: sess.holdFor, bankedSeconds: h.bankedSeconds, targetHit: h.targetHit === true, away: h.away === true, lastAnnounced: h.lastAnnounced, lastLiveAnnounced: h.lastLiveAnnounced };
+  }
+  return null;
+}
+
+/* THE SESSION'S STATE THAT MUST OUTLIVE A KILL, AS PLAIN DATA ON THE DRAFT.
+   The device-local copy (draft-store.js) is taken from ctx.state.logDraft by
+   the controller, which knows nothing about this session object — so what
+   would otherwise die with it is mirrored onto the draft as `draft.live`
+   (draft-store.js lists what it keeps and why). It has to be written at the
+   moment the thing changes, not on the next render: the controller writes the
+   copy BEFORE it renders, and an app sent to the background mid-pause gets no
+   later chance.
+
+   A paused circuit is left out: its schedule is not kept, so after a relaunch
+   there is nothing to put the pause back on. */
+function liveBlock(sess) {
+  const snap = pausedSnapshot(sess);
+  return {
+    records: (sess.records || []).map(r => ({ key: r.key, exercise: r.exercise, kind: r.kind, val: r.val, prev: r.prev })),
+    goalCount: sess.goalCount || 0,
+    metGoals: [...(sess.metGoals || [])],
+    paused: snap && snap.kind !== 'timed' ? snap : null,
+  };
+}
+
+function syncLive(draft, sess) {
+  if (draft && sess) draft.live = liveBlock(sess);
+}
+
+/* Mirror, then write the device-local copy now — for the in-place changes
+   (a hold paused or resumed) that re-render nothing. */
+function keepLive(ctx, draft, sess) {
+  syncLive(draft, sess);
+  keepDraft(ctx);
+}
+
+/* The inverse, for a session starting fresh on a draft that came back from the
+   device: the draft-store already validated it, this only gives it the shapes
+   the session uses (a Set, fresh arrays). */
+function restoredTally(draft) {
+  const live = (draft && draft.live) || {};
+  return {
+    records: (Array.isArray(live.records) ? live.records : []).map(r => Object.assign({}, r)),
+    goalCount: Number.isInteger(live.goalCount) ? live.goalCount : 0,
+    metGoals: new Set(Array.isArray(live.metGoals) ? live.metGoals : []),
+    paused: live.paused || null,
+  };
+}
+
+/* Put a paused clock back on a FRESH session — only if the session lands on
+   the very thing that was paused. The overview may have been used in between
+   (a set logged by hand moves the first unhandled set on), and a pause that
+   belonged to set 1 must not turn up on set 2. */
+function restorePaused(sess, draft, snap) {
+  if (!snap) return;
+  if (snap.kind === 'timed') {
+    const tp = sess.timed;
+    const intervals = (draft.timed && draft.timed.intervals) || [];
+    const iv = intervals[snap.index];
+    if (!tp || !iv) return;
+    /* WHERE A FRESH SESSION LANDS IS NOT WHERE THE PAUSE WAS (audit C-04).
+       timed-plan.initialIndex puts a fresh session on the TRANSITION before the
+       first unfinished work interval, so a circuit paused on interval 3 never
+       found itself on interval 3 and came back running, its frozen seconds
+       gone. The user's own pause is a better answer than that default, so the
+       session moves to it — provided it is not BEHIND where the session would
+       start (a hand-logged set has moved things on), and not a work interval
+       whose set has since been handled on the overview. */
+    if (snap.index < tp.index) return;
+    if (iv.kind === 'work') {
+      const entry = draft.entries[iv.entryIndex];
+      const set = entry && entry.sets && entry.sets[iv.setIndex];
+      if (set && flow.isHandled(set)) return;
+    }
+    tp.index = snap.index;
+    Object.assign(tp, timerState.frozenClock(snap.bankedSeconds), { spokenAt: snap.spokenAt, announcedFor: snap.announcedFor });
+    return;
+  }
+  if (flow.isDone(draft, sess.pos)) return;
+  const key = setKey(sess.pos);
+  if (snap.kind === 'rest' && snap.next === key) {
+    sess.phase = 'resting';
+    sess.pendingPos = { entryIndex: sess.pos.entryIndex, setIndex: sess.pos.setIndex };
+    sess.pendingCallouts = snap.callouts;
+    sess.rest = timerState.frozenClock(snap.bankedSeconds);
+    return;
+  }
+  if (snap.kind === 'hold' && snap.key === key) {
+    const cur = flow.currentSet(draft, sess.pos);
+    if (!cur || !cur.entry.duration || cur.entry.distance) return;
+    sess.hold = Object.assign({
+      running: true, frozenSeconds: snap.bankedSeconds,
+      lastAnnounced: snap.lastAnnounced, lastLiveAnnounced: snap.lastLiveAnnounced, targetHit: snap.targetHit, away: snap.away === true,
+    }, timerState.frozenClock(snap.bankedSeconds));
+    sess.holdFor = key;
+    /* It had already begun, so it must not count in again. */
+    sess.countedIn = key;
+  }
+}
+
+function findExercise(ctx, name) {
+  return (ctx.data.exercises || []).find(e => sameName(e.name, name));
+}
+
+/* ---------- active state ---------- */
+
+function renderActive(ctx, root, draft, sess) {
+  const cur = flow.currentSet(draft, sess.pos);
+  if (!cur) { ctx.rerender(); return; } // isDone should already have caught this
+  const { entry, set, entryIndex, setIndex } = cur;
+
+  /* SKIPPING SAYS SO. These were two chevron icons sitting next to the X,
+     with their meaning only in an aria-label — so "I'm done with this
+     movement, go to the next one" was invisible, and the reporter reached
+     for X instead, which reads as abandoning the whole session. Written
+     words, at the cost of a little width: an unlabelled icon that moves you
+     through a workout is not a control anyone can find under load. */
+  const skipSetBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small gv-session-skip', type: 'button', 'aria-label': 'Skip this set' },
+    ico('skip-forward'), el('span', {}, 'Set'));
+  skipSetBtn.addEventListener('click', () => {
+    flow.markSkipped(draft, sess.pos);   // remembered if you leave and come back
+    keepDraft(ctx);
+    sess.pos = flow.skipSet(draft, sess.pos);
+    resetActiveState(sess);
+    ctx.rerender();
+  });
+  const skipExBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small gv-session-skip', type: 'button', 'aria-label': 'Skip this exercise' },
+    ico('chevrons-right'), el('span', {}, 'Exercise'));
+  skipExBtn.addEventListener('click', () => {
+    flow.markExerciseSkipped(draft, sess.pos);
+    keepDraft(ctx);
+    sess.pos = flow.skipExercise(draft, sess.pos);
+    resetActiveState(sess);
+    ctx.rerender();
+  });
+
+  const ord = el('div', { class: 'gv-session-ord' },
+    `Exercise ${entryIndex + 1}/${draft.entries.length} · Set ${setIndex + 1}/${entry.sets.length}`);
+  const extra = el('div', { class: 'gv-session-top-extra' }, ord,
+    el('div', { class: 'gv-session-skips' },
+      el('span', { class: 'gv-session-skip-kicker' }, 'Skip'), skipSetBtn, skipExBtn));
+
+  /* THE POSTER CHROME (Apex + Lock In; live-chrome.js). A different arrangement
+     of the SAME controls: the skip buttons built above move down into the
+     sheet beside the counter's own, and the top row is the close button and
+     "Move n of N". Floor and Editorial never reach this and build exactly the
+     nodes they always did. A run (distance) keeps the plain chrome: its body
+     has no sheet for the skips to live in. */
+  if (posterSkin(ctx) && !entry.distance) {
+    root.append(posterTop(ctx, draft, entryIndex));
+    root.append(posterHead(ctx, sess, entry, entryIndex, setIndex));
+    const posterBody = entry.duration ? durationBody(ctx, draft, sess, entry, set)
+      : entry.weighted ? weightedBody(ctx, draft, sess, entry, set)
+        : repsBody(ctx, draft, sess, entry, set);
+    const skipSlot = posterBody.querySelector('.gv-live-skips');
+    if (skipSlot) skipSlot.append(el('span', { class: 'gv-session-skip-kicker' }, 'Skip'), skipSetBtn, skipExBtn);
+    root.append(posterBody);
+    return;
+  }
+
+  root.append(topBar(ctx, draft, extra));
+  root.append(exerciseBlock(ctx, sess, entry));
+
+  /* The count-in is NOT a screen of its own any more — it happens inside the
+     counter (see repsBody / durationBody, via attachCountIn). What used to be
+     here was a full-bleed ring that replaced the whole body, counted down,
+     and only then revealed the thing you were about to use. */
+  if (entry.distance) root.append(distanceBody(ctx, draft, sess, entry, set));
+  else if (entry.duration) root.append(durationBody(ctx, draft, sess, entry, set));
+  else if (entry.weighted) root.append(weightedBody(ctx, draft, sess, entry, set));
+  else root.append(repsBody(ctx, draft, sess, entry, set));
+}
+
+function exerciseBlock(ctx, sess, entry) {
+  const ex = findExercise(ctx, entry.exercise);
+  const head = el('div', { class: 'gv-session-exhead' },
+    el('h2', { class: 'gv-display gv-session-exname' }, entry.exercise),
+    entry.target ? el('div', { class: 'gv-session-target' }, entry.target) : '');
+  /* Guided view only ever animates a start->finish pair — cap BEFORE error
+     handling wires up, so a dropped frame 1 never promotes a frame 3 that
+     was never even resolved for this view (the detail page still shows
+     everything; this cap is guided-view only). */
+  const img = ex ? exerciseMedia(ctx, sess, ex) : null;
+  return el('div', { class: 'gv-session-exblock' }, head, img || '');
+}
+
+/* The exercise's picture on the live set: its Muscle Map when it has a motion
+   (motion-library.js), the photo cross-fade for everything else. Both are the
+   same frame (the thumbnail in the poster skins, the larger one in Floor and
+   Editorial) and both open the full-screen viewer on a tap. */
+function exerciseMedia(ctx, sess, ex) {
+  const frames = resolveExerciseImages(ctx, ex).slice(0, MEDIA_MAX_FRAMES);
+  const motion = canDraw() ? motionFor(ex) : null;
+  return (motion && sessionMuscleMap(ctx, sess, ex, motion, frames)) || guidedImageBlock(sess, ex, frames, viewerOpts(ctx));
+}
+
+/* THE MUSCLE MAP IN THE FRAME. The bare figure (mini: no switch, no legend, no
+   labels, no fibres), looping at the note's tempo; or one still pose when
+   media-cycle.js autoPlayMedia says so (reduced motion, or Settings ->
+   "Animate exercise images" off), the same single rule the photos obey.
+
+   A tap opens the viewer on the MAP, large, with "Photos" one tap away. It is
+   the frame itself that takes the tap, outside the counter zone, so it counts
+   no rep and touches no clock (see guidedImageBlock's note, which is why the
+   viewer keeps its own loop). Its stop() lives on `sess` beside the photo
+   cycle's timer, for the same reason (see render()); and the clock lives there
+   too, so a logged set (which rebuilds this card) carries the rep on instead of
+   restarting it at the top.
+
+   A map that cannot build never costs a workout: any failure returns null and
+   the caller draws the photos instead. */
+function sessionMuscleMap(ctx, sess, ex, motion, frames) {
+  const wrap = el('div', { class: 'gv-session-media gv-session-mm' });
+  const frame = el('div', { class: 'gv-media-frame gv-session-frame gv-session-frame-open gv-session-mmframe' });
+  wrap.append(frame);
+  const prefs = visualPrefs(ctx.settings);
+  if (!sess.muscleMapClock || sess.muscleMapClock.exercise !== ex.name) sess.muscleMapClock = { exercise: ex.name, t: 0 };
+  try {
+    sess.stopMuscleMap = mountMuscleMap(frame, {
+      /* the poster skins' slot is a 96x72 thumbnail; Floor and Editorial's is a wide frame */
+      ex, motion, mini: posterSkin(ctx) ? 'thumb' : 'frame', body: prefs.body, clock: sess.muscleMapClock,
+      autoPlay: autoPlayMedia(ctx.settings, confetti.prefersReducedMotion()),
+    });
+  } catch (e) {
+    console.error('gym-vault muscle map', e);
+    sess.stopMuscleMap = null;
+    return null;
+  }
+  frame.append(el('span', { class: 'gv-media-expand', 'aria-hidden': 'true' }, ico('maximize-2')));
+  const openViewer = () => {
+    const host = viewerOpts(ctx);
+    openMediaViewer(host.app, {
+      name: ex.name, frames, startIndex: 0, skin: host.skin, accent: host.accent, settings: host.settings, returnFocus: frame,
+      muscleMap: { ex, motion, steps: noteSteps(ex.body), startMs: sess.muscleMapClock.t, onDetail: d => rememberDetail(ctx, d) },
+    });
+  };
+  frame.setAttribute('role', 'button');
+  frame.setAttribute('tabindex', '0');
+  frame.setAttribute('aria-label', `Show ${ex.name} larger`);
+  frame.addEventListener('click', openViewer);
+  frame.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault(); // ' ' must not also scroll the page
+    openViewer();
+  });
+  return wrap;
+}
+
+/* What the full-screen viewer needs from the page: the app (it is a Modal) and
+   the user's skin and accent, so it wears them like the rep counter does. */
+function viewerOpts(ctx) {
+  const st = ctx.settings || {};
+  return { app: ctx.app, skin: st.skin || 'apex', accent: st.accent || 'lime', settings: st };
+}
+
+/* ---------- the poster chrome (live-chrome.js) ---------- */
+
+function posterSkin(ctx) { return chrome.isLockInSkin((ctx.settings || {}).skin); }
+
+/* Close, the song, and which move this is: the mockups' top row. The thin
+   session bar stays under it, because "how far through the whole session" is
+   a real figure the chip does not carry. */
+function posterTop(ctx, draft, entryIndex) {
+  return el('div', { class: 'gv-session-top gv-live-top' },
+    el('div', { class: 'gv-session-top-row gv-live-toprow' }, exitButton(ctx, draft), musicButton(ctx) || '',
+      el('span', { class: 'gv-live-chip' }, chrome.moveLabel(entryIndex, draft.entries.length))),
+    progressBar(draft));
+}
+
+/* The name, the plan's target (and what the set before logged), the media as a
+   thumbnail beside them, and the rail of set pips. The h2 and the media are the
+   same nodes the plain block builds; only their arrangement differs. */
+function posterHead(ctx, sess, entry, entryIndex, setIndex) {
+  const ex = findExercise(ctx, entry.exercise);
+  const img = ex ? exerciseMedia(ctx, sess, ex) : null;
+  const sub = chrome.subLine(entry, setIndex, fmtSeconds);
+  const label = chrome.railLabel(setIndex, entry.sets.length);
+  return el('div', { class: 'gv-session-exblock gv-live-head' + (img ? ' has-media' : '') },
+    el('div', { class: 'gv-live-headtext' },
+      el('h2', { class: 'gv-display gv-session-exname gv-live-name' }, entry.exercise),
+      sub ? el('div', { class: 'gv-session-target gv-live-sub' }, sub) : ''),
+    img || '',
+    el('div', { class: 'gv-live-rail', role: 'img', 'aria-label': label },
+      ...chrome.railPips(entry.sets, setIndex).map(p => el('span', { class: `gv-live-pip is-${p}` })),
+      el('b', {}, label)));
+}
+
+/* The small slab under the count saying what a tap does. Decoration: the
+   zone's own aria-label already says it. */
+function tapChip(text) { return el('div', { class: 'gv-rc-tapchip', 'aria-hidden': 'true' }, text); }
+
+/* The sheet under the counter: what comes next, the controls used once per
+   set, and (for a set-by-set screen) the one big slab. `tickBtn` is the SAME
+   button the plain screen's bar holds, with the same listener. The "up next"
+   row is real flow: where Tick set leads, and the rest the plan gives it. */
+function posterSheet(ctx, draft, sess, utilityKids, tickBtn) {
+  const next = chrome.nextUp(draft, sess.pos);
+  const rest = restSecondsFor(ctx);
+  let nextRow = '';
+  if (next) {
+    const lead = next.last ? 'Last set' : rest > 0 ? 'Rest · starts on tick' : 'Up next';
+    nextRow = el('div', { class: 'gv-live-next' },
+      rest > 0 && !next.last ? el('div', { class: 'gv-live-ring', 'aria-hidden': 'true' }, el('b', {}, fmtSeconds(rest))) : '',
+      el('div', { class: 'gv-live-nextbody' },
+        el('p', { class: 'gv-live-lbl' }, lead),
+        el('p', { class: 'gv-live-nx' }, next.last ? "Then you're done" : `Up next: ${next.name}`,
+          !next.last && next.detail ? el('small', {}, next.detail) : '')));
+  }
+  return el('div', { class: 'gv-live-sheet' }, nextRow,
+    el('div', { class: 'gv-live-utility' }, ...utilityKids, el('div', { class: 'gv-live-skips' })),
+    tickBtn ? el('div', { class: 'gv-live-tickwrap' }, tickBtn) : '');
+}
+
+/* One compact media frame with every resolved image stacked absolutely
+   inside it, auto-crossfading between them so a start->finish pair reads as
+   the movement animating (session-flow.js has no say here — this is pure
+   presentation over whatever frames resolved). A single image is static; a
+   dead/offline image is dropped from the rotation the moment it errors and
+   never gets a chance to flash on screen; once everything has failed the
+   whole block disappears, same graceful-degrade rule as page-exercise-
+   detail.js's mediaBlock. The interval this starts is registered on `sess`
+   (not ctx.setPageInterval — see render()'s comment) and is always cleared
+   before a new one is created. */
+function guidedImageBlock(sess, ex, frames, host) {
+  if (!frames.length) return null;
+  const wrap = el('div', { class: 'gv-session-media' });
+  const frame = el('div', { class: 'gv-media-frame gv-session-frame gv-session-frame-open' });
+  const imgs = frames.map(({ src, tag }) =>
+    el('img', { class: 'gv-session-cycle-img', src, alt: `${ex.name} — ${tag}`, loading: 'lazy' }));
+  imgs.forEach(img => frame.append(img));
+  frame.append(el('span', { class: 'gv-media-expand', 'aria-hidden': 'true' }, ico('maximize-2')));
+  wrap.append(frame);
+
+  const failed = new Set();
+  let current = 0;
+  imgs[0].classList.add('gv-session-cycle-on');
+
+  const showFrame = idx => {
+    imgs.forEach((img, i) => img.classList.toggle('gv-session-cycle-on', i === idx));
+    current = idx;
+  };
+
+  imgs.forEach((img, i) => {
+    img.addEventListener('error', () => {
+      failed.add(i);
+      img.remove();
+      if (failed.size >= imgs.length) { // nothing left — vanish quietly, and stop cycling nothing
+        wrap.remove();
+        if (sess.mediaCycleTimer) { window.clearInterval(sess.mediaCycleTimer); sess.mediaCycleTimer = null; }
+        return;
+      }
+      if (current === i) {
+        const next = nextFrameIndex(imgs.length, failed, i);
+        if (next !== null) showFrame(next);
+      }
+      if (imgs.length - failed.size <= 1 && sess.mediaCycleTimer) { // one frame left — static, no need to keep ticking
+        window.clearInterval(sess.mediaCycleTimer);
+        sess.mediaCycleTimer = null;
+      }
+    });
+  });
+
+  /* TAP TO ENLARGE (media-viewer.js). The thumbnail is far too small to read
+     the form from, so it opens the full-screen viewer on the frame showing now.
+     It is its own element, outside the counter zone, so it never reaches the
+     tap zone's listeners: opening it counts no rep. It touches no clock either
+     (the viewer keeps its own timer; see media-viewer.js), so a hold, a rest
+     or a circuit keeps running while the user checks their form. Only frames
+     that have not failed go in, and the start index is re-found among them. */
+  const openViewer = () => {
+    const live = frames.filter((_, i) => !failed.has(i));
+    if (!live.length) return;
+    openMediaViewer(host.app, {
+      name: ex.name, frames: live, startIndex: Math.max(0, live.indexOf(frames[current])),
+      skin: host.skin, accent: host.accent, settings: host.settings, returnFocus: frame,
+    });
+  };
+  frame.setAttribute('role', 'button');
+  frame.setAttribute('tabindex', '0');
+  frame.setAttribute('aria-label', `Show ${ex.name} larger`);
+  frame.addEventListener('click', openViewer);
+  frame.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault(); // ' ' must not also scroll the page
+    openViewer();
+  });
+
+  if (imgs.length <= 1) return wrap; // static — no timer, nothing to cycle
+
+  /* No auto-cycle when autoPlayMedia says so: reduced motion (which also drops
+     the opacity transition in the CSS) or Settings -> "Animate exercise images"
+     off. Frame 1 holds; the other positions are the viewer's job (it opens
+     paused, with next/previous, and Play for that viewing). */
+  if (!autoPlayMedia(host.settings, confetti.prefersReducedMotion())) return wrap;
+
+  sess.mediaCycleTimer = window.setInterval(() => {
+    const next = nextFrameIndex(imgs.length, failed, current);
+    if (next !== null && next !== current) showFrame(next);
+  }, MEDIA_CYCLE_MS);
+
+  return wrap;
+}
+
+/* The guided view's motion toggle. Unlike the modal's, the ON/OFF state
+   lives on `sess` so it survives the re-render that every completed set
+   triggers — a counter that switched itself back to tap mode between set 2
+   and set 3 would be worse than never offering motion at all. The subscription
+   itself is torn down and restarted by that re-render, which is cheap and
+   keeps this out of the page-cleanup slot the wake lock owns.
+
+   The click IS the user gesture iOS demands for requestPermission(); nothing
+   here may await before startMotionCounter is called. */
+/* The exercise note is the home of `motion_sensitivity`, so the picker reads
+   from it and writes back to it: a value corrected once during a set is right
+   the next time that exercise comes round, in any plan, on any screen. */
+function exerciseSensitivity(ctx, name) {
+  const ex = findExercise(ctx, name);
+  return sensitivityKey(ex && ex.fm ? ex.fm.motion_sensitivity : null);
+}
+
+function saveExerciseSensitivity(ctx, name, value) {
+  const ex = findExercise(ctx, name);
+  if (!ex || !ex.file) return; // a plan line with no note behind it — nothing to write to
+  ex.fm.motion_sensitivity = value;
+  Promise.resolve(ctx.io.saveExercise(ex)).catch(e => console.error('gym-vault sensitivity', e));
+}
+
+/* `motion_counting` on the exercise note is remembered the same way, for the
+   same reason, as the sensitivity above: whether the phone can count THIS
+   movement is a property of the movement. Written only when it changes.
+   A plan line with no note behind it has nothing to write to — there the
+   toggle still works for the session (sess.motionChoices), it just is not
+   remembered next time. */
+function exerciseMotionPref(ctx, name) {
+  const ex = findExercise(ctx, name);
+  return motionPref(ex && ex.fm);
+}
+
+function saveExerciseMotionPref(ctx, name, on) {
+  saveMotionPref(ctx, findExercise(ctx, name), on); // no note: nothing to write to
+}
+
+/* Decide, for the exercise this screen is about to show, whether motion is
+   ON — see initialMotion for the rule. Runs on EVERY render of the reps
+   screen, so a different exercise gets ITS answer rather than inheriting the
+   last one's, and a re-render of the same exercise gets the same answer back.
+   A device with no motion sensor stays off whatever the note says. */
+function resolveMotion(ctx, sess, entry) {
+  const r = initialMotion(sess, entry.exercise, exerciseMotionPref(ctx, entry.exercise));
+  sess.motionOn = r.on && motionAvailable();
+  sess.motionKey = motionKey(entry.exercise);
+  sess.motionHint = '';
+}
+
+/* What the hint line says while this exercise is not counting from motion:
+   normally nothing, or the soft line after a remembered start that could not
+   begin. */
+const motionHintText = sess => (sess.motionOn ? 'Counting your movement — taps still work' : (sess.motionHint || ''));
+
+function motionButton(ctx, sess, entry, onRep, hintEl, sensEl, countingIn) {
+  const btn = el('button', {
+    class: `gv-icon-btn${sess.motionOn ? ' gv-icon-btn-on' : ''}`, type: 'button',
+    'aria-pressed': sess.motionOn ? 'true' : 'false',
+    'aria-label': motionAvailable()
+      ? (sess.motionOn ? 'Stop counting from movement' : 'Count reps from movement')
+      : 'No motion sensor on this device',
+  }, ico('activity'));
+  if (!motionAvailable()) { btn.disabled = true; return btn; }
+
+  const stop = () => {
+    if (sess.stopMotion) { sess.stopMotion(); sess.stopMotion = null; }
+  };
+  const myKey = motionKey(entry.exercise);
+  let sensitivity = exerciseSensitivity(ctx, entry.exercise);
+  /* The sensitivity picker only exists while motion is on: in tap mode it
+     would be a control over nothing. Drawn apart from sync() so a screen that
+     OPENS with motion on (a remembered preference, or the re-render after a
+     set) gets its picker without sync() also rewriting the hint line the
+     count-in is still using. */
+  const drawSensitivity = () => {
+    if (!sensEl) return;
+    clear(sensEl);
+    if (!sess.motionOn) return;
+    sensEl.append(segmented(
+      [['low', 'Low'], ['normal', 'Normal'], ['high', 'High']],
+      sensitivity,
+      value => {
+        sensitivity = sensitivityKey(value);
+        saveExerciseSensitivity(ctx, entry.exercise, sensitivity);
+        sync();
+        /* Restart rather than retune: the thresholds are baked into the
+           detector at creation, and half a set counted each way is a number
+           nobody can interpret afterwards. Reps already banked stay. */
+        if (!sess.motionOn) return;
+        stop();
+        if (hintEl) hintEl.textContent = 'Restarting at ' + sensitivity + ' sensitivity…';
+        begin(true);
+      },
+      { label: 'Sensitivity' },
+    ));
+  };
+  const sync = () => {
+    btn.classList.toggle('gv-icon-btn-on', !!sess.motionOn);
+    btn.setAttribute('aria-pressed', sess.motionOn ? 'true' : 'false');
+    btn.setAttribute('aria-label', sess.motionOn ? 'Stop counting from movement' : 'Count reps from movement');
+    /* The soft line waits out the count-in: the numeral is already telling
+       you what is happening, and the count-in puts this line back itself
+       when it hands over (see repsBody). */
+    if (hintEl && !(!sess.motionOn && sess.motionHint && countingIn && countingIn())) hintEl.textContent = motionHintText(sess);
+    drawSensitivity();
+  };
+  /* `viaGesture`: this start is inside a tap (the toggle, the sensitivity
+     picker). A render that finds motion already on — a remembered
+     preference, or the re-render after a set — is NOT: iOS may refuse
+     requestPermission() there for that reason alone, and that must not be
+     reported as the user saying no. See motionFailureCopy. */
+  /* ONE START PER EXERCISE, HOWEVER MANY RENDERS PASS WHILE IT IS PENDING
+     (audit L3-10). startMotionCounter's promise stays open while iOS shows its
+     prompt, and sess.stopMotion is only set when it resolves - so a re-render
+     in that window found motion ON with no subscription and started a SECOND
+     one: two permission requests, then two devicemotion listeners, every rep
+     counted twice (one of them into a detached screen). Now a render that finds
+     a start for this same exercise still in flight does not ask again; it takes
+     over the answer (`handlers` is swapped for the newest render's, `via` keeps
+     the fact that the first start was a tap). A start for ANOTHER exercise is
+     left to answer for itself, and a late answer for an exercise that is no
+     longer on screen stops its listener rather than adopting it. */
+  const begin = viaGesture => {
+    const handlers = {
+      onRep,
+      onStatus: (status, via) => {
+        /* A late report from a screen the user has already left must not
+           switch off the exercise they are on now. */
+        if (sess.motionKey !== myKey) return;
+        /* OFF for the rest of this session for this exercise — not retried
+           (and not re-explained) on every set. Only the SESSION forgets: the
+           note's preference is untouched, so next time it tries again. */
+        chooseMotion(sess, entry.exercise, false);
+        stop();
+        const copy = motionFailureCopy(status, via);
+        sess.motionHint = copy.hint;
+        sync();
+        if (copy.notice) new Notice(copy.notice, 6000);
+      },
+      /* The sensor answered yes (or its first sample arrived): the line that
+         said "Asking for the motion sensor…" says what is now true (audit L3-13). */
+      settle: () => { if (sess.motionKey === myKey && sess.motionOn) sync(); },
+    };
+    const inFlight = sess.motionStart;
+    if (inFlight && inFlight.key === myKey) {
+      inFlight.handlers = handlers;
+      inFlight.via = inFlight.via || viaGesture;
+      return;
+    }
+    const start = { key: myKey, via: viaGesture, handlers };
+    sess.motionStart = start;
+    startMotionCounter({
+      onRep: () => start.handlers.onRep(),
+      sensitivity,
+      onStatus: status => {
+        if (status === 'listening') { start.handlers.settle(); return; }
+        start.handlers.onStatus(status, start.via);
+      },
+    }).then(fn => {
+      if (sess.motionStart === start) sess.motionStart = null;
+      /* Adopt it only if this is still the live session, still on this
+         exercise, still wanting motion, and nothing else is subscribed. */
+      if (ctx.state.session === sess && sess.motionOn && sess.motionKey === myKey && !sess.stopMotion) {
+        sess.stopMotion = fn;
+        start.handlers.settle();
+      } else fn();
+    });
+  };
+
+  /* A re-render lands here with motion already ON and no live subscription:
+     render() tears down the previous render's sess.stopMotion explicitly,
+     right next to the media-cycle timer — the listener is on window, not the
+     DOM, so nothing does that for free. Pick it back up here. This is also
+     how an exercise whose note remembers motion starts counting. */
+  if (sess.motionOn) drawSensitivity();
+  if (sess.motionOn && !sess.stopMotion) begin(false);
+
+  btn.addEventListener('click', () => {
+    if (sess.motionOn) {
+      chooseMotion(sess, entry.exercise, false);
+      sess.motionHint = '';
+      stop(); sync();
+      saveExerciseMotionPref(ctx, entry.exercise, false);
+      return;
+    }
+    chooseMotion(sess, entry.exercise, true);
+    sess.motionHint = '';
+    sync();
+    if (hintEl) hintEl.textContent = 'Asking for the motion sensor…';
+    begin(true);
+    saveExerciseMotionPref(ctx, entry.exercise, true);
+  });
+  return btn;
+}
+
+/* Mute is "silence right now", for this session only — a different thing
+   from ctx.settings.soundMode, which is "when this app does speak, how". So
+   the button is disabled rather than hidden when the MODE is already silent:
+   there is nothing to mute, and a live-looking control that does nothing is
+   worse than a visibly inert one. */
+function muteButton(ctx, sess, onToggle) {
+  const canHear = sound.audible(ctx.settings);
+  const btn = el('button', {
+    class: 'gv-icon-btn', type: 'button',
+    'aria-label': canHear ? (sess.muted ? 'Unmute count-back' : 'Mute count-back') : 'Count-back is off in settings',
+  }, ico(sess.muted ? 'volume-x' : 'volume-2'));
+  if (!canHear) btn.disabled = true;
+  btn.addEventListener('click', () => {
+    sess.muted = !sess.muted;
+    if (sess.muted) sound.cancel();
+    clear(btn);
+    btn.append(ico(sess.muted ? 'volume-x' : 'volume-2'));
+    btn.setAttribute('aria-label', sess.muted ? 'Unmute count-back' : 'Mute count-back');
+    if (onToggle) onToggle();
+  });
+  return btn;
+}
+
+/* THE LIVE "BEAT YOUR BEST" TARGET. A small block above the counter: "Beat
+   12 / You're on 6 / 7 to go" and a bar that fills to the best.
+
+   Built once per render and then updated IN PLACE by set(current) from the
+   same places that already update the meter and the numeral - never by
+   re-rendering, which would restart the count-in and the power-up. `best`
+   comes from progress.liveBest, so the block only exists where this screen
+   would also celebrate the figure (applyCompletion's trust rule), and `beaten`
+   is records.isRecord via pbTarget: the flag turns on at the moment Done would
+   record the set, not a rep earlier or later.
+
+   `kind` only decides how a figure is written ('seconds' as 0:45-style times,
+   everything else as plain numbers). */
+function pbTargetBlock(best, kind, rich) {
+  if (best === null || best === undefined) return null;
+  const say = v => (kind === 'seconds' ? fmtSeconds(v) : String(v));
+  const label = el('span', { class: 'gv-pb-target-label' });
+  const now = el('span', { class: 'gv-pb-target-now' });
+  const togo = el('span', { class: 'gv-pb-target-togo' });
+  const fill = el('div', { class: 'gv-pb-target-fill' });
+  /* The aria-label below is rewritten every rep and a label is never spoken
+     on its own, so a VoiceOver user would hear nothing when the record falls.
+     This polite region is the announcement, and it speaks on the TRANSITION
+     into beaten only - never per rep (the count is already announced by the
+     numeral's own live region, and "new personal best" nine reps in a row is
+     noise). The first set() is the baseline: a re-render that finds the set
+     already past the record has announced it before and must not again. It is
+     emptied when the set drops back under, so a later crossing speaks again
+     and the stale words are never left to be read. */
+  const live = el('span', { class: 'gv-sr-only', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+  let wasBeaten = null;
+  /* POSTER SKINS ONLY (live-chrome.js): the mockup's "PB target" kicker above
+     the label, and the 0 / n% / PB n scale under the bar. The same figures the
+     slab already holds, laid out as the design draws them. */
+  const kicker = rich ? el('span', { class: 'gv-pb-target-kicker' }, 'PB target') : '';
+  const marks = rich ? el('div', { class: 'gv-pb-target-marks', 'aria-hidden': 'true' }, el('span', {}), el('span', {}), el('span', {})) : null;
+  const node = el('div', { class: 'gv-pb-target', role: 'group' }, kicker, label, now, togo,
+    el('div', { class: 'gv-pb-target-bar' }, fill), marks || '', live);
+  const set = current => {
+    const t = pbTarget(best, current);
+    if (!t) return;
+    if (wasBeaten === false && t.beaten) live.textContent = 'New personal best';
+    else if (!t.beaten) live.textContent = '';
+    wasBeaten = t.beaten;
+    node.classList.toggle('is-beaten', t.beaten);
+    label.textContent = t.beaten ? 'New PB' : `Beat ${say(t.best)}`;
+    now.textContent = `You're on ${say(t.current)}`;
+    togo.textContent = t.beaten ? `${say(t.over)} over` : `${say(t.toGo)} to go`;
+    fill.setAttribute('style', `width:${t.pct}%`);
+    if (marks) {
+      marks.children[0].textContent = say(0);
+      marks.children[1].textContent = t.beaten ? 'New PB' : `${Math.round(t.pct)}% of PB`;
+      marks.children[2].textContent = `PB ${say(t.best)}`;
+    }
+    node.setAttribute('aria-label', t.beaten
+      ? `New personal best: ${say(t.current)}, beating ${say(t.best)}`
+      : `Personal best target: beat ${say(t.best)}, you are on ${say(t.current)}, ${say(t.toGo)} to go`);
+  };
+  return { node, set };
+}
+
+/* Plain reps: an embedded tap zone (same rules as rep-counter-modal.js, via
+   rep-counter-shared.js) plus a small control bar. `extraTop` lets
+   weightedBody prepend a weight field above the SAME zone/bar instead of
+   duplicating the tap-counter markup. */
+function repsBody(ctx, draft, sess, entry, set, extraTop) {
+  if (!sess.counter || sess.counterFor !== setKey(sess.pos)) {
+    sess.counter = createCounter();
+    sess.counterFor = setKey(sess.pos);
+  }
+  /* BEFORE anything below reads sess.motionOn (the hint line, the count-in's
+     hint): which exercise is this, and does it count from motion? */
+  resolveMotion(ctx, sess, entry);
+  const poster = posterSkin(ctx);
+
+  /* aria-live: see rep-counter-modal.js's countEl for why speech isn't
+     enough on its own. */
+  const countEl = el('div', { class: 'gv-rc-count gv-session-count', 'aria-live': 'polite', 'aria-atomic': 'true' }, String(sess.counter.count));
+  const zone = el('div', { class: 'gv-rc-zone gv-session-zone' + (poster ? ' gv-live-zone' : ''), role: 'button', tabindex: '0', 'aria-label': `Tap to count a rep for ${entry.exercise}` }, countEl);
+
+  /* The plan already said what this set is for, so nothing has to be asked:
+     "4 x 12" fills towards 12. An open-ended line ("submax") gets no meter
+     at all rather than an empty one that never fills. */
+  const target = counterTarget.targetFromEntry(entry);
+  const meter = attachFillMeter(zone, target);
+  /* The best to beat, when this screen would celebrate beating it. Present for
+     a plain reps entry with history; absent for a weighted one (its record is
+     weight, which the tap counter does not observe), a run, or an exercise
+     never logged. Kept in step wherever the meter is. */
+  const pb = pbTargetBlock(liveTarget(ctx, sess, entry, OBSERVED_REPS.observed), 'reps', poster);
+  /* The detonation the meter charges towards — only exists when the meter
+     does, and fires once via markHit's own guard. */
+  const powerUp = meter ? attachPowerUp(zone, 'Reps reached') : null;
+  /* "TARGET 15 REPS", not "of 15 reps". The label sits under a giant
+     numeral, and a fragment starting with "of" reads as the tail of a
+     sentence whose head is a digit — fine in prose, wrong as a standalone
+     line you glance at mid-set. Naming the thing is shorter AND clearer. */
+  const targetEl = target
+    ? el('div', { class: 'gv-rc-target' }, `Target ${counterTarget.describeTarget(target)}`)
+    /* The poster's count has a caption under it; an open-ended set still
+       needs one to say what the numeral counts. */
+    : (poster ? el('div', { class: 'gv-rc-target' }, 'Reps') : '');
+
+  let flashTimer = null;
+  /* Fires once, when the target is first met — not on every rep past it.
+     Beating your own target is the moment worth marking; the eight reps
+     after it are not eight more moments. */
+  const markHit = () => {
+    if (sess.targetHitFor === setKey(sess.pos)) return;
+    sess.targetHitFor = setKey(sess.pos);
+    if (powerUp) powerUp.fire();
+    if (!sess.muted) sound.cue('go', 'target', ctx.settings, { hold: true });
+  };
+  const showRep = () => {
+    countEl.textContent = String(sess.counter.count);
+    punch(countEl, sess.counter.count);
+    zone.classList.add('gv-rc-flash');
+    if (flashTimer) window.clearTimeout(flashTimer);
+    flashTimer = window.setTimeout(() => { zone.classList.remove('gv-rc-flash'); flashTimer = null; }, FLASH_MS);
+    if (meter && meter.set(sess.counter.count) === 'done') markHit();
+    if (pb) pb.set(sess.counter.count);
+    if (!sess.muted) sound.announce(sess.counter.count, ctx.settings);
+  };
+  /* THE TAP THAT SAYS "READY" IS NOT REP ONE. While the count-in is running
+     a tap skips it; only once armed does a tap count. Without this the
+     gesture that dismisses the countdown lands as the first rep and every
+     set starts one ahead. */
+  const registerTap = () => {
+    if (countIn && !countIn.armed()) {
+      countIn.skip();
+      /* AND IT LEAVES A DEBOUNCE BEHIND (audit L3-04). Skipping arms the counter
+         at once, and a fresh counter has no memory of a previous tap, so a double
+         tap — the second landing 60 ms later — counted as rep one. Stamping the
+         skip as a tap makes the ordinary debounce cover its own echo. */
+      sess.counter = { count: sess.counter.count, lastTapAt: Date.now() };
+      return;
+    }
+    const result = tap(sess.counter, Date.now());
+    sess.counter = result.state;
+    if (!result.counted) return;
+    showRep();
+  };
+  /* Motion-detected reps bypass the tap debounce — motion-count.js runs its
+     own refractory window, and stacking the two would drop any rep landing in
+     the gap between them.
+
+     THEY DO NOT BYPASS THE COUNT-IN. motionOn survives set to set, and the
+     detector warms up in about 1.2s of a 5s gate — so a phone still moving
+     from the last rep scored into the next set before it had begun, and
+     showRep() overwrote the countdown digit with a live count. The set
+     started ahead and the numeral was no longer the countdown.
+
+     DROPPED, NOT SKIPPED — and that is the difference from registerTap
+     above. A tap on the zone is a deliberate "I'm ready", so it dismisses
+     the gate. A phone wobbling on the bench says nothing of the kind, and
+     letting it skip would hand the count-in away to a shoelace. */
+  const registerMotionRep = () => {
+    if (countIn && !countIn.armed()) return;
+    sess.counter = tap(sess.counter, Date.now(), 0).state;
+    showRep();
+  };
+  attachTapZone(zone, registerTap);
+
+  const hintEl = el('div', { class: 'gv-rc-hint', 'aria-live': 'polite' }, sess.motionOn ? 'Counting your movement — taps still work' : '');
+  const sensEl = el('div', { class: 'gv-rc-sens' });
+  zone.append(targetEl, hintEl, sensEl, poster ? tapChip('Tap to count') : '');
+
+  /* Count in, in the counter's own display. Keyed by POSITION so the screen
+     can re-render for any of the reasons it does without restarting the
+     count — including a GENUINE full re-render (a vault sync landing
+     mid-gate, say), not only the interaction paths (a mute toggle, motion
+     switched on, a typed weight) that update their own corner of the DOM
+     directly and never call ctx.rerender() at all (0.11.2 journey audit,
+     finding L8 — the claim used to stop at the harmless case).
+
+     A full render rebuilds this body from scratch, which used to mean a
+     fresh attachCountIn seeded from a fresh Date.now() — so the one
+     re-render that DOES land mid-gate silently put the numeral back at 5.
+     sess.countInStartedFor/countInStartedAt are the actual clock, carried
+     across that rebuild; sess.countedIn is only the flag for "already
+     armed" and says nothing about a count still in progress. Any sequencer
+     still running from a previous render of this same set is torn down
+     first, or two of them speak over each other and the earlier one arms
+     the counter behind the later. */
+  const countInKey = setKey(sess.pos);
+  let countIn = null;
+  if (sess.countedIn !== countInKey) {
+    if (sess.stopCountIn) { sess.stopCountIn(); sess.stopCountIn = null; }
+    if (sess.countInStartedFor !== countInKey) {
+      sess.countInStartedFor = countInKey;
+      sess.countInStartedAt = Date.now();
+    }
+    countIn = attachCountIn(zone, countEl, {
+      startedAt: sess.countInStartedAt,
+      /* A GETTER: the mute button is live for all five seconds of the
+         count-in, and a copied boolean ignored it. */
+      muted: () => sess.muted,
+      settings: ctx.settings,
+      hintEl,
+      /* A getter: a remembered start that fails during the count-in leaves
+         its soft line in sess.motionHint, to be shown when this hands over. */
+      hint: () => motionHintText(sess),
+      onDone: () => {
+        sess.countedIn = countInKey;
+        countEl.textContent = String(sess.counter.count);
+      },
+    });
+    sess.stopCountIn = countIn.stop;
+  } else {
+    sess.stopCountIn = null;
+  }
+  /* Catches up a counter that already has reps on it — resuming a set, or a
+     re-render after a typed count — so the bar is never behind the number
+     above it. */
+  if (meter) meter.set(sess.counter.count);
+  if (pb) pb.set(sess.counter.count);
+
+  /* No bare numeral on it any more: "− 1" beside a big live count is what
+     read as a stepper. Inside the sheet it has a written label, so the icon
+     alone is unambiguous. */
+  const undoBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small', type: 'button', 'aria-label': 'Undo last rep' },
+    ico('minus'), el('span', {}, 'Undo'));
+  undoBtn.addEventListener('click', () => {
+    sess.counter = undo(sess.counter);
+    countEl.textContent = String(sess.counter.count);
+    if (meter) meter.set(sess.counter.count);
+    if (pb) pb.set(sess.counter.count);
+  });
+
+  /* Typed counts are for the sets the sensor and the taps both missed — a
+     machine you cannot put the phone on, a set you counted in your head.
+     lastTapAt is carried through unchanged so typing does not open a fresh
+     debounce window that eats the next real tap, which is the same reason
+     undo() leaves it alone. */
+  const typeBtn = typeCountButton(countEl, {
+    label: `Reps for ${entry.exercise}`,
+    get: () => sess.counter.count,
+    set: n => {
+      sess.counter = { count: n, lastTapAt: sess.counter.lastTapAt };
+      if (meter) meter.set(n);
+      if (pb) pb.set(n);
+    },
+  });
+
+  const tick = chrome.tickCopy((ctx.settings || {}).skin);
+  const doneBtn = el('button', { class: tick.poster ? 'gv-btn-go gv-live-tick' : 'gv-btn gv-btn-small', type: 'button' }, ico('check'), el('span', {}, tick.label));
+  /* OBSERVED_REPS ALWAYS — this button is shared by a plain reps entry
+     AND a weighted one (weightedBody wraps this same body). The tap counter
+     watched the reps either way; it never watched the weight, so this list
+     must not grow a 'weight' entry just because the entry is weighted —
+     that would be right back to finding 2 (an untouched @60kg prefill
+     claiming a false record). */
+  doneBtn.addEventListener('click', () => {
+    sound.unlock(); // audit M-04: Tick is a gesture too, and the rest that follows speaks
+    /* A TICK ON A COUNT-IN IS NOT A SET (audit R2-14). Inside the five seconds
+       nothing has been counted, and "Tick set" saved a 0-rep set that counted
+       for XP and the quest. With nothing on the counter it is the same gesture
+       a tap on the zone is — "ready" — and skips the count-in; a count the user
+       typed in already is a real set and still saves. */
+    if (countIn && !countIn.armed() && !(sess.counter.count > 0)) {
+      countIn.skip();
+      sess.counter = { count: sess.counter.count, lastTapAt: Date.now() };
+      return;
+    }
+    completeSet(ctx, draft, sess, set, entry, { reps: String(sess.counter.count) }, OBSERVED_REPS);
+  });
+
+  /* SIX BUTTONS BECAME FOUR, AND THEN THREE. Motion, Type and the explainer
+     are decisions made once, at the start of a set — they sat at thumb
+     height for the whole set next to the two that are used mid-rep, and a
+     row of six identical buttons makes the eye read all of them every time
+     it comes back from the number.
+
+     Undo followed them (issue #3): rendered as a minus icon beside a bare
+     "1", directly under the big count, it read as a second rep counter
+     sitting at 1. It is a correction, not a counter. What stays on the floor
+     is mute and Done — and neither of them is a number. */
+  const motionBtn = motionButton(ctx, sess, entry, registerMotionRep, hintEl, sensEl, () => !!countIn && !countIn.armed());
+  const helpBtn = helpButton(() => body);
+  const settingsBtn = counterSettingsButton(() => body, () => [
+    { label: 'Undo a rep', hint: 'Takes one back off the count', node: undoBtn, closeOnUse: true },
+    { label: 'Motion counting', hint: 'Let the phone count the movement itself', node: motionBtn },
+    { label: 'Type the count', hint: 'For the reps the taps and the sensor both missed', node: typeBtn, closeOnUse: true },
+    { label: 'How this counts', hint: 'Tapping, tilting and sensitivity', node: helpBtn, closeOnUse: true },
+  ]);
+
+  /* ONE NUMBER, ONE JOB. Undo rendered as a minus icon beside a bare "1",
+     on the floor directly under the big count — so a first-run tester read
+     the pair as a SECOND rep counter sitting at 1, and could not tell which
+     of the two numbers on screen was live. It is a correction, not a
+     counter, so it moves in beside Type, where 0.10.1 already put the other
+     control you reach for once rather than mid-rep.
+
+     The floor is now mute and Done: the two things a thumb reaches for
+     without looking up, and neither of them is a number. */
+  const bar = el('div', { class: 'gv-rc-bar gv-session-rcbar' },
+    settingsBtn, muteButton(ctx, sess), doneBtn);
+  /* Both sheets host on the BODY, not the zone: they have to cover the
+     controls as well, or the button stays visible under its own panel. */
+  /* The poster arrangement: PB target, the count, the weight stepper (when the
+     entry has one), then the sheet. The settings, mute and Tick buttons are the
+     ones built above; `bar` just stops being their parent. */
+  const body = poster
+    ? el('div', { class: 'gv-session-body gv-xp-host gv-live' }, pb ? pb.node : '', zone, extraTop || '',
+      posterSheet(ctx, draft, sess, [...bar.children].filter(n => n !== doneBtn), doneBtn))
+    : el('div', { class: 'gv-session-body gv-xp-host' }, extraTop || '', pb ? pb.node : '', zone, bar);
+  focusMode(ctx);
+  return body;
+}
+
+/* FOCUS MODE. The brand bar and the tab strip are ~116px of chrome that
+   nothing inside a set uses, and on a phone they push the counter down far
+   enough that the number and the Done button compete for the same thumb.
+   Adding the class here rather than in the controller keeps the decision
+   with the screens that actually count something; ctx.rerender clears it at
+   the top of every render, so it can never outlive the counter. The session
+   bar keeps its X, which is the way out. */
+function focusMode(ctx) {
+  if (ctx.view && ctx.view.contentEl) ctx.view.contentEl.classList.add('gv-focus');
+}
+
+function lastWeightForExercise(ctx, name) {
+  for (let i = ctx.data.workouts.length - 1; i >= 0; i--) {
+    const rows = ctx.data.workouts[i].rows || [];
+    for (let j = rows.length - 1; j >= 0; j--) {
+      const r = rows[j];
+      if (!sameName(r.exercise, name)) continue;
+      const wt = String(r.weight_kg ?? '').trim();
+      if (wt) return wt;
+    }
+  }
+  return null;
+}
+
+/* THE WEIGHT A WEIGHTED SET OPENS ON (audit R2-05). In order:
+     1. the user's own figure on this set, if they have typed one — never moved;
+     2. the weight of the nearest EARLIER set of this entry in THIS session that
+        will be saved (stats.setCounts: ticked, or typed with a figure) and has
+        one — set 2 lifted at 22 means set 3 opens on 22, not on the plan's 20
+        again. The log's own rule, so what carries is what the log holds;
+     3. a blank box: the exercise's last weight from history.
+   Whatever this puts in the box is a PREFILL: `touched` is left alone, so the
+   figure is saved with the set but, like a plan-target prefill, never claims a
+   weight record on its own (applyCompletion's trust rule). One function for the
+   set-by-set screen and the timed circuit, so they cannot carry differently. */
+function carriedWeight(entry, set) {
+  const at = entry.sets.indexOf(set);
+  for (let j = at - 1; j >= 0; j--) {
+    const prev = entry.sets[j];
+    if (!prev || !setCounts(prev)) continue;
+    const w = String(prev.weight_kg ?? '').trim();
+    if (w) return w;
+  }
+  return null;
+}
+
+function prefillWeight(ctx, entry, set) {
+  if (!set.touched) {
+    const carried = carriedWeight(entry, set);
+    if (carried !== null) { set.weight_kg = carried; return; }
+  }
+  if (String(set.weight_kg ?? '').trim() === '') {
+    const last = lastWeightForExercise(ctx, entry.exercise);
+    if (last !== null) set.weight_kg = last; // prefill only — not touched, same as a plan-target prefill
+  }
+}
+
+function weightedBody(ctx, draft, sess, entry, set) {
+  prefillWeight(ctx, entry, set);
+  /* 2.5 kg plates exist, and type="number" refused the decimal. */
+  const weightInput = numericInput({
+    class: 'gv-set-input gv-session-weight', placeholder: 'kg', value: set.weight_kg ?? '',
+    'aria-label': `Weight in kilograms — ${entry.exercise}`,
+  }, v => { set.weight_kg = v; set.touched = true; keepDraft(ctx); });
+  const weightRow = el('div', { class: 'gv-session-weightrow' }, weightInput, el('span', { class: 'gv-set-unit' }, 'kg'));
+  if (posterSkin(ctx)) {
+    /* POSTER: the weight as a stepper, minus and plus either side of the same
+       field (design 07 / 10). The buttons write exactly what typing does, so
+       the figure is the user's and the set counts as touched. */
+    const step = dir => {
+      const cur = parseFloat(weightInput.value);
+      const next = Math.max(0, Math.round(((Number.isFinite(cur) ? cur : 0) + dir * WEIGHT_STEP_KG) * 100) / 100);
+      weightInput.value = String(next);
+      set.weight_kg = String(next);
+      set.touched = true;
+      keepDraft(ctx);
+    };
+    const stepBtn = (dir, icon, label) => {
+      const b = el('button', { class: 'gv-icon-btn gv-live-step', type: 'button', 'aria-label': label }, ico(icon));
+      b.addEventListener('click', () => step(dir));
+      return b;
+    };
+    const stepper = el('div', { class: 'gv-live-weight' },
+      stepBtn(-1, 'minus', `Weight minus ${WEIGHT_STEP_KG} kilograms`),
+      el('div', { class: 'gv-live-weightval' }, weightInput, el('span', { class: 'gv-set-unit' }, 'kg')),
+      stepBtn(1, 'plus', `Weight plus ${WEIGHT_STEP_KG} kilograms`));
+    return repsBody(ctx, draft, sess, entry, set, stepper);
+  }
+  return repsBody(ctx, draft, sess, entry, set, weightRow);
+}
+
+/* How long a hold has run: its clock (timer-state.js) while it is running —
+   which is exact across a pause, the paused time is never in it — and the
+   frozen figure otherwise. The stop path, the paused Done and commitLiveSet
+   all read it here, so a hold finished from a pause records what was held. */
+function heldSeconds(hold) {
+  return hold.running ? timerState.elapsedSeconds(hold, Date.now()) : hold.frozenSeconds;
+}
+
+/* Duration/holds: tap to start, tap to stop — stop IS the completion action
+   (it records the elapsed seconds and advances), no separate Done button.
+
+   PAUSE. A separate control, because stop IS completion: a pause that
+   shared the zone's tap would save the set. The button freezes the clock (the
+   paused time is never counted — timer-state.js), the zone then reads
+   "tap to resume" so a stray tap on a paused hold can never complete it, and a
+   Done beside the button finishes the set from the pause, recording the frozen
+   seconds. The hold's fields: `running` means begun (it stays true while
+   paused, so ending the session still banks the figure), `paused` means
+   frozen, and startedAt / bankedSeconds are the clock. */
+function durationBody(ctx, draft, sess, entry, set) {
+  if (!sess.hold || sess.holdFor !== setKey(sess.pos)) {
+    /* NOT set.seconds — that is the plan's target sitting in the box, and
+       seeding the stopwatch with it made the numeral say 0:30 before the
+       clock had run. counter-target.resumeSeconds owns the rule: only a
+       figure the user actually measured is a time to count on from. */
+    sess.hold = { running: false, startedAt: null, bankedSeconds: 0, paused: false, frozenSeconds: counterTarget.resumeSeconds(set), lastAnnounced: -1, lastLiveAnnounced: -1, targetHit: false };
+    sess.holdFor = setKey(sess.pos);
+  }
+  const hold = sess.hold;
+  const poster = posterSkin(ctx);
+
+  /* What the numeral shows: the running clock, else the frozen figure. A
+     screen rebuilt mid-hold (a re-render, or coming back to a paused one)
+     must open on the real value, not 0:00 until the next tick. */
+  const shownSeconds = () => (hold.running ? heldSeconds(hold) : (hold.frozenSeconds || 0));
+  const countEl = el('div', { class: 'gv-rc-count gv-session-count' }, fmtSeconds(shownSeconds()));
+  const zone = el('div', {
+    class: 'gv-rc-zone gv-session-zone' + (poster ? ' gv-live-zone gv-live-hold' : ''), role: 'button', tabindex: '0',
+    'aria-label': hold.running ? 'Tap to stop the hold' : 'Tap to start the hold',
+  }, countEl);
+  /* countEl above ticks every second (below) — an aria-live region there
+     would read out every single second, which is noise, not help. This is
+     a SEPARATE, visually-hidden region that only gets new text at the same
+     15s checkpoints speak() already announces, so a screen-reader user gets
+     the same cadence a hearing/sighted+speech user does, independent of
+     whether count-back speech is muted (aria-live is not a substitute for
+     THIS app's own speech, and must not be gated by the app's own mute
+     toggle — a screen-reader user isn't necessarily using it). Needs
+     .gv-sr-only (visually-hidden-but-AT-visible) in styles.css. */
+  const checkpointEl = el('div', { class: 'gv-sr-only', 'aria-live': 'polite', 'aria-atomic': 'true' });
+
+  /* A hold fills against the CLOCK, not against taps — same meter, same
+     stages, driven by the tick below. "3 x 45s" fills towards 45. */
+  const target = counterTarget.targetFromEntry(entry);
+  const meter = attachFillMeter(zone, target);
+  if (meter && hold.running) meter.set(shownSeconds());
+  /* A hold's target moment gets the same detonation a rep target does —
+     the clock reaching the goal is no less of a reward than a tap. A hold
+     is not reps, so the badge says what was actually reached. */
+  const powerUp = meter ? attachPowerUp(zone, 'Time reached') : null;
+  if (target) zone.append(el('div', { class: 'gv-rc-target' }, `Target ${counterTarget.describeTarget(target)}`));
+  else if (poster) zone.append(el('div', { class: 'gv-rc-target' }, 'Hold'));
+
+  /* The hold's best to beat, against the same whole seconds the stop button
+     will record (Math.round of the clock), so the flag flips on the second
+     Done would call it a record. */
+  const pb = pbTargetBlock(liveTarget(ctx, sess, entry, OBSERVED_SECONDS.observed), 'seconds', poster);
+  if (pb) pb.set(Math.round(shownSeconds()));
+
+  const currentSeconds = () => heldSeconds(hold);
+
+  /* The paused state, in one place: the zone's wording and live styling, a
+     visible "Paused" line (the hint line every counter already has, so every
+     skin and every stage already colours it), the button and the Done. Called
+     on build, on pause, on resume and on begin — so a screen rebuilt from
+     `hold` always reads right. */
+  const hintEl = el('div', { class: 'gv-rc-hint' });
+  const chip = poster ? tapChip('Tap to start') : null;
+  zone.append(hintEl, chip || '');
+  const playBtn = playButton(hold.paused === true);
+  const doneLabel = chrome.tickCopy((ctx.settings || {}).skin).label;
+  const doneBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-hold-done', type: 'button' },
+    ico('check'), el('span', {}, doneLabel));
+  /* THE PLAY BUTTON NEVER MOVES. Done appears beside it only while paused, and
+     if it were added to a centred row the button just pressed would slide
+     left — so a second tap at the same spot would land on Done and end the
+     set. Done is therefore always in the row (hidden and disabled when not
+     paused), with an identical hidden twin on the other side to keep the play
+     button centred. No CSS: the visibility is written inline. */
+  const spacer = el('button', { class: 'gv-btn gv-btn-ghost gv-hold-spacer', type: 'button', disabled: 'true', tabindex: '-1', 'aria-hidden': 'true' },
+    ico('check'), el('span', {}, doneLabel));
+  spacer.disabled = true;
+  spacer.style.setProperty('visibility', 'hidden');
+  const controls = el('div', { class: 'gv-timed-controls' }, spacer, playBtn, doneBtn);
+  const paintState = () => {
+    const paused = hold.running && hold.paused === true;
+    zone.classList.toggle('gv-session-zone-live', hold.running && !paused);
+    zone.setAttribute('aria-label', paused ? 'Tap to resume the hold' : hold.running ? 'Tap to stop the hold' : 'Tap to start the hold');
+    /* "tap to resume" is said ONCE: by the chip in the poster skins (it is the control's label, and it reads
+       "Tap to start" / "Tap to stop" the rest of the time), so their hint is just the state. Floor and Editorial
+       draw no chip, so their one hint keeps the instruction. */
+    hintEl.textContent = paused ? (chip ? 'Paused' : 'Paused · tap to resume') : '';
+    if (chip) chip.textContent = paused ? 'Tap to resume' : hold.running ? 'Tap to stop' : 'Tap to start';
+    syncPlayButton(playBtn, paused);
+    /* Nothing to pause before the hold has begun (the count-in has Skip). */
+    playBtn.disabled = !hold.running;
+    doneBtn.disabled = !paused;
+    doneBtn.style.setProperty('visibility', paused ? 'visible' : 'hidden');
+    if (paused) doneBtn.removeAttribute('aria-hidden'); else doneBtn.setAttribute('aria-hidden', 'true');
+  };
+
+  let holdCountIn = null;
+
+  const beginHold = () => {
+    Object.assign(hold, timerState.startClock(Date.now()), { running: true });
+    paintState();
+  };
+
+  /* THE ONE STOP PATH, for the zone's tap on a running hold and for the Done
+     beside a paused one. It reads heldSeconds, which is exact across a pause. */
+  const stopHold = () => {
+    const secs = Math.round(currentSeconds());
+    hold.running = false;
+    hold.paused = false;
+    hold.frozenSeconds = secs;
+    /* OBSERVED_SECONDS — the stopwatch above genuinely ran for this
+       many seconds; unlike a timed interval's clock, it was started and
+       stopped by the user's own taps, not merely allowed to elapse. */
+    completeSet(ctx, draft, sess, set, entry, { seconds: String(secs) }, heldObserved(hold));
+  };
+
+  const pauseHold = () => {
+    if (!hold.running || hold.paused) return;
+    Object.assign(hold, timerState.pauseClock(hold, Date.now()));
+    /* Whatever is mid-sentence (a count-back, the target word) stops with the
+       clock; nothing queued may play over the pause. */
+    sound.cancel();
+    /* Show the frozen figure NOW: the next tick is up to a second away and
+       does not paint while paused. Only the displays — the target moment and
+       the checkpoints belong to the tick, which does not run while paused. */
+    const secs = currentSeconds();
+    countEl.textContent = fmtSeconds(secs);
+    if (pb) pb.set(Math.round(secs));
+    if (meter) meter.set(secs);
+    paintState();
+    checkpointEl.textContent = 'Paused';
+    keepLive(ctx, draft, sess);
+  };
+
+  const resumeHold = () => {
+    if (!hold.running || !hold.paused) return;
+    Object.assign(hold, timerState.resumeClock(hold, Date.now()));
+    paintState();
+    checkpointEl.textContent = 'Resumed';
+    keepLive(ctx, draft, sess);
+  };
+
+  playBtn.addEventListener('click', () => {
+    /* A tap this session depends on being able to speak after (audit M-04). */
+    sound.unlock();
+    if (hold.paused) resumeHold(); else pauseHold();
+  });
+  doneBtn.addEventListener('click', () => { if (hold.running && hold.paused) stopHold(); });
+
+  /* When the tap that skipped the count-in landed. Skipping BEGINS the hold in
+     the same breath, so a double tap's echo 60 ms later used to stop it at
+     about zero seconds and save that (audit L3-04). Taps inside the counter's
+     own debounce window after it are the same gesture, not a stop. */
+  let skippedAt = null;
+  const startStop = () => {
+    if (holdCountIn && !holdCountIn.armed()) { holdCountIn.skip(); skippedAt = Date.now(); return; }
+    if (skippedAt !== null && Date.now() - skippedAt < DEBOUNCE_MS) return;
+    if (!hold.running) beginHold();
+    /* A tap on a PAUSED hold resumes it. Never completes: from the paused
+       state a stray tap must not be able to save a half-set — Done is the
+       deliberate way out. */
+    else if (hold.paused) resumeHold();
+    else stopHold();
+  };
+  attachTapZone(zone, startStop);
+
+  ctx.setPageInterval(() => {
+    /* A paused hold does nothing here: no numeral, no meter, no target
+       moment, no checkpoint. The interval keeps running (one slot, replaced
+       each render), but the clock it reads is frozen. */
+    if (!hold.running || hold.paused) return;
+    const secs = currentSeconds();
+    countEl.textContent = fmtSeconds(secs);
+    if (pb) pb.set(Math.round(secs));
+    if (meter && meter.set(secs) === 'done' && hold.targetHit !== true) {
+      /* Once, at the moment the hold reaches its target — the seconds after
+         it are bonus, not a second announcement. */
+      hold.targetHit = true;
+      if (powerUp) powerUp.fire();
+      if (!sess.muted) sound.cue('go', 'target', ctx.settings, { hold: true });
+    }
+    const whole = Math.floor(secs);
+    const atCheckpoint = whole > 0 && whole % HOLD_CHECKPOINT_S === 0;
+    if (atCheckpoint && whole !== hold.lastLiveAnnounced) {
+      hold.lastLiveAnnounced = whole;
+      checkpointEl.textContent = `${fmtSeconds(whole)} held`;
+    }
+    if (atCheckpoint && whole !== hold.lastAnnounced && !sess.muted) {
+      hold.lastAnnounced = whole;
+      sound.announce(whole, ctx.settings);
+    }
+  }, 1000);
+
+  /* Count in inside the clock's own display, then START it — "Begin" has to
+     mean something. The reps counter arms and waits for you; a hold that
+     said Begin and then sat there asking for a second tap would lose the
+     seconds between reading the word and finding the button.
+
+     Keyed by position for the same reason as the rep counter's: this
+     function runs again on every render of the set, INCLUDING a genuine
+     full re-render that lands mid-gate — countInStartedFor/countInStartedAt
+     on `sess` are what actually carry the elapsed time across that rebuild;
+     see repsBody's count-in for the full account (0.11.2 journey audit,
+     finding L8). */
+  const holdKey = setKey(sess.pos);
+  if (sess.countedIn !== holdKey) {
+    if (sess.stopCountIn) { sess.stopCountIn(); sess.stopCountIn = null; }
+    if (sess.countInStartedFor !== holdKey) {
+      sess.countInStartedFor = holdKey;
+      sess.countInStartedAt = Date.now();
+    }
+    const countIn = attachCountIn(zone, countEl, {
+      startedAt: sess.countInStartedAt,
+      /* A GETTER: the mute button is live for all five seconds of the
+         count-in, and a copied boolean ignored it. */
+      muted: () => sess.muted,
+      settings: ctx.settings,
+      onDone: () => {
+        sess.countedIn = holdKey;
+        countEl.textContent = fmtSeconds(hold.frozenSeconds || 0);
+        if (!hold.running) beginHold();
+      },
+    });
+    sess.stopCountIn = countIn.stop;
+    /* A tap during the count-in means "now", not "start the hold" — the
+       hold's own start is what onDone does a beat later. */
+    holdCountIn = countIn;
+  } else {
+    sess.stopCountIn = null;
+  }
+
+  paintState();
+  const bar = el('div', { class: 'gv-rc-bar gv-session-rcbar' }, muteButton(ctx, sess));
+  focusMode(ctx);
+  if (poster) {
+    /* The hold has no Tick slab (stopping IS completing); the sheet carries
+       what is next and the controls used once per set. The pause row stays
+       between the count and the sheet, exactly where the plain screen has it. */
+    return el('div', { class: 'gv-session-body gv-live' }, pb ? pb.node : '', zone, controls, checkpointEl,
+      posterSheet(ctx, draft, sess, [...bar.children], null));
+  }
+  return el('div', { class: 'gv-session-body' }, pb ? pb.node : '', zone, controls, checkpointEl, bar);
+}
+
+function lastRunForExercise(ctx, name) {
+  for (let i = ctx.data.workouts.length - 1; i >= 0; i--) {
+    const rows = ctx.data.workouts[i].rows || [];
+    for (let j = rows.length - 1; j >= 0; j--) {
+      const r = rows[j];
+      if (!sameName(r.exercise, name)) continue;
+      if (String(r.distance_km ?? '').trim() === '') continue;
+      const secs = parseFloat(r.seconds);
+      return {
+        distance_km: String(r.distance_km).trim(),
+        minutes: Number.isFinite(secs) ? timedPlan.minutesText(secs) : '',
+      };
+    }
+  }
+  return null;
+}
+
+function distanceBody(ctx, draft, sess, entry, set) {
+  if (String(set.distance_km ?? '').trim() === '' && String(set.minutes ?? '').trim() === '') {
+    const last = lastRunForExercise(ctx, entry.exercise);
+    if (last) { set.distance_km = last.distance_km; set.minutes = last.minutes; }
+  }
+  /* THE REPORTED ONE: a 4.3 km run could not be logged here. */
+  const kmInput = numericInput({
+    class: 'gv-set-input gv-session-distance', placeholder: 'km', value: set.distance_km ?? '',
+    'aria-label': `Distance in kilometres — ${entry.exercise}`,
+  }, v => { set.distance_km = v; set.touched = true; keepDraft(ctx); paintLog(); });
+  const minInput = numericInput({
+    class: 'gv-set-input gv-session-distance', placeholder: 'min', value: set.minutes ?? '',
+    'aria-label': `Minutes — ${entry.exercise}`,
+  }, v => { set.minutes = v; set.touched = true; keepDraft(ctx); paintLog(); });
+
+  const row = el('div', { class: 'gv-session-runrow' },
+    el('div', { class: 'gv-session-runfield' }, kmInput, el('span', { class: 'gv-set-unit' }, 'km')),
+    el('div', { class: 'gv-session-runfield' }, minInput, el('span', { class: 'gv-set-unit' }, 'min')));
+
+  const doneBtn = el('button', { class: 'gv-btn gv-session-donebtn', type: 'button' }, ico('check'), el('span', {}, 'Log run'));
+  /* A RUN WITH NOTHING ENTERED IS NOT A RUN (audit L1-04). "Log run" with both
+     boxes empty ticked the set and ended on a "Finish & save" that only showed a
+     notice, because page-log.setWorthSaving refuses a run with neither figure.
+     Either box is enough (that rule's own test), so the button waits for one,
+     and says so in words - a disabled button alone explains nothing. */
+  const hasRun = () => String(set.distance_km ?? '').trim() !== '' || String(set.minutes ?? '').trim() !== '';
+  const runHint = el('div', { class: 'gv-rc-hint', 'aria-live': 'polite' });
+  function paintLog() {
+    const ok = hasRun();
+    doneBtn.disabled = !ok;
+    runHint.textContent = ok ? '' : 'Enter km or minutes to log this run';
+  }
+  paintLog();
+  doneBtn.addEventListener('click', () => {
+    if (!hasRun()) return; // assistive tech and stale taps can reach a disabled button's handler
+    completeSet(ctx, draft, sess, set, entry, {});
+  });
+
+  return el('div', { class: 'gv-session-body gv-session-body-plain' }, row, runHint, doneBtn);
+}
+
+/* ---------- completing a set: write, celebrate, transition ---------- */
+
+/* classifyKind lives in progress.js now, so Today can ask the same question
+   about a plan line that this screen asks about the entry built from it; it is
+   still exported from here (see the foot of the file). */
+
+function valueForKind(set, kind) {
+  if (kind === 'seconds') return set.seconds;
+  if (kind === 'weight') return set.weight_kg;
+  if (kind === 'reps') return set.reps;
+  return null;
+}
+
+function describeRecord(kind, val, prev) {
+  if (kind === 'reps') return `${val} reps (was ${prev})`;
+  if (kind === 'weight') return `${val} kg (was ${prev} kg)`;
+  if (kind === 'seconds') return `${fmtSeconds(val)} hold (was ${fmtSeconds(prev)})`;
+  return '';
+}
+
+/* BY HOW MUCH — the number the completion screen leads with, because "21
+   reps" only means something next to "was 14". The arithmetic and the wording
+   are progress.pbDelta / progress.marginText, shared with the PB moment's chips
+   and the Records page, so the same margin cannot read two ways. */
+function describeMargin(kind, val, prev) {
+  const d = pbDelta(prev, val);
+  return d ? marginText(kind, d.abs) : '';
+}
+
+/* THE FIGURE A SET HAS TO BEAT RIGHT NOW (audit R2-09) — ONE RULE, used by the
+   announcement (applyCompletion) and by the live "Beat n" target (liveTarget),
+   so the flag on the counter and the callout after Done cannot disagree:
+
+       max( the history best going in,  the record already set for this
+                                        exercise+kind in THIS session )
+
+   Both used to read the history snapshot alone, so repeating a best you had just
+   set re-announced "NEW BEST (was 8)" with confetti, and the next set's target
+   still chased the 8. `historyBest` null/undefined (never logged) stays that:
+   there is nothing to beat, and the first-ever set is not a record. */
+function recordKey(entry, kind) { return `${entry.exercise}/${kind}`; }
+
+function figureToBeat(sess, historyBest, entry, kind) {
+  if (historyBest === null || historyBest === undefined) return historyBest;
+  const row = (sess.records || []).find(r => r.key === recordKey(entry, kind));
+  const mine = row ? parseFloat(row.val) : NaN;
+  return Number.isFinite(mine) && mine > historyBest ? mine : historyBest;
+}
+
+/* The live screen's target: progress.liveBest (which already applies the
+   observed-kind and claimableKinds gates), raised to this session's own best. */
+function liveTarget(ctx, sess, entry, observed) {
+  const base = liveBest(sess.workoutsAtStart, findExercise(ctx, entry.exercise), entry, observed);
+  return base === null || base === undefined ? base : figureToBeat(sess, base, entry, classifyKind(entry));
+}
+
+/* Newly-met goals since the session started: compares the goal's progress
+   using ONLY history from before this session (sess.workoutsAtStart) against
+   history PLUS everything completed in this draft so far — a synthetic,
+   never-saved workout built with the exact same row rule finishSession uses
+   (page-log.js's buildRows), so "would this session, saved right now, meet
+   the goal" can never disagree with what Finish actually saves. */
+function checkGoalReached(ctx, sess, draft) {
+  const hits = [];
+  if (!ctx.data.goals || !ctx.data.goals.length) return hits;
+  const today = todayISO();
+  const syntheticWorkout = { fm: { date: draft.date, day: draft.day }, rows: buildRows(draft) };
+  /* `exercises` is the library: stats.goalCurrent uses it to refuse a metric the
+     exercise's unit cannot claim (contract K1), the same gate the Records page and
+     the goals page apply. Without it a live session could "meet" a goal that no
+     other surface would ever show progress on. */
+  const exercises = ctx.data.exercises;
+  const before = { workouts: sess.workoutsAtStart, body: ctx.data.body, weekStart: ctx.settings.weekStart, today, exercises };
+  const after = { workouts: sess.workoutsAtStart.concat([syntheticWorkout]), body: ctx.data.body, weekStart: ctx.settings.weekStart, today, exercises };
+  for (const g of ctx.data.goals) {
+    if (sess.metGoals.has(g.name)) continue;
+    const wasMet = goalProgress(g, goalCurrent(g, before)) === 1;
+    const nowMet = goalProgress(g, goalCurrent(g, after)) === 1;
+    if (!wasMet && nowMet) { sess.metGoals.add(g.name); hits.push(g); }
+  }
+  return hits;
+}
+
+/* `cue` is a sound.js event kind ('record' | 'goal') or null for confetti
+   with no announcement. Not a plain string any more: a beep or a buzz cannot
+   say "new record", so the EVENT has to travel, not just the words — the
+   words are what the voice mode reads out, the kind is what the other modes
+   turn into their own shape. */
+function celebrate(ctx, sess, cueKind, words) {
+  try {
+    if (sess.confettiStop) sess.confettiStop();
+    const host = ctx.view && ctx.view.contentEl;
+    sess.confettiStop = confetti.burst(host);
+    if (!sess.muted && cueKind) sound.cue(cueKind, words, ctx.settings);
+  } catch (e) { console.error('gym-vault celebrate', e); }
+}
+
+/* Write the figures into the set, then work out whether that just broke a
+   record or met a goal. Shared by both guided renderers — the set-by-set one
+   below and the timed one — so "what counts as a record" can never come to
+   mean two different things depending on which screen you were looking at.
+   Returns the callout lines to show on the way to the next thing.
+
+   `opts.observed` is the list of record KINDS this call site actually
+   watched the user produce — not a single measured/unmeasured flag, because
+   the same screen can watch one figure and merely prefill another. The
+   set-by-set reps screen watches reps (the tap counter) but never weight
+   (typed once and left alone, or carried over from last time) — so a set
+   with an untouched `@ 60kg` prefill must not claim a weight record just
+   because the reps beside it were real. The set-by-set duration screen
+   watches seconds (the stopwatch genuinely ran that long). A timed interval
+   watches NEITHER reps/weight (the plan's target sitting in the box) NOR
+   seconds (an interval that counts down to zero and ends is a scheduled
+   duration, not an observed hold — the user could have dropped at 40s of a
+   90s plank and let the clock run out empty).
+
+   Per kind, a figure is trustworthy — and so claimable as a record — if
+   EITHER this screen observed that kind directly, OR the user typed it
+   themselves (typedByUser, read BEFORE this call touches set.touched, since
+   afterwards every completed set reads as touched and the distinction is
+   gone). A typed figure is always the user's own word for what happened,
+   whichever screen it was typed on. */
+function applyCompletion(ctx, draft, sess, set, entry, values, opts) {
+  const observed = (opts && opts.observed) || [];
+  const typedByUser = !!set.touched;
+
+  Object.assign(set, values);
+  set.done = true;
+  /* A CLOCK IS NOT THE USER'S WORD (audit L3-05). `touched` is what later reads
+     as "the user typed or measured this" — timedSetValues keeps a touched set's
+     figure, and typedByUser (above) lets it claim a record. A timed interval
+     passes observed: [], its only figure is the schedule elapsing, and marking
+     the set touched turned that clock reading into a "typed" one: re-running the
+     interval then claimed a NEW BEST 1:00 hold from the clock alone. Only a call
+     site that actually watched a figure (the tap counter, the stopwatch) marks
+     the set touched; `done` is what saves it either way. */
+  if (observed.length) set.touched = true;
+
+  const callouts = [];
+  try {
+    const kind = classifyKind(entry);
+    const trustworthy = observed.indexOf(kind) !== -1 || typedByUser;
+    /* THE SAME GATE EVERY OTHER SURFACE USES (audit L1-03). Records, Today and
+       the live target all ask records.claimableKinds; this was the one place
+       that did not, so a kg-unit exercise with a "2 x 40s" line got a live NEW
+       BEST for a hold the Records page refuses to show. */
+    const note = findExercise(ctx, entry.exercise);
+    /* Only an exercise WITH a note has a unit to gate on; a bare plan line has
+       none, and keeps claiming what it observed, as it always did. */
+    const claimable = !!kind && (!note || records.claimableKinds(note).indexOf(kind) !== -1);
+    if (kind && trustworthy && claimable) {
+      const prev = figureToBeat(sess, records.previousBest(sess.workoutsAtStart, entry.exercise, kind), entry, kind);
+      const val = valueForKind(set, kind);
+      if (records.isRecord(prev, val)) {
+        /* Keep the DETAIL, not just the tally. The completion screen used to
+           print "2 records broken" because that was all that survived to it —
+           the exercise, the figure and the margin were all computed here and
+           thrown away one line later.
+
+           Keyed by exercise+kind so beating the same best twice in one
+           session shows ONE row against the real previous best, not two rows
+           racing each other. previousBest already reads from
+           sess.workoutsAtStart for exactly this reason; the display has to
+           honour the same snapshot rule or it would contradict it. */
+        const key = recordKey(entry, kind);
+        const existing = sess.records.find(r => r.key === key);
+        if (existing) {
+          /* THE BEST OF THE SESSION, NOT THE LATEST ATTEMPT (0.11.2 journey
+             audit, finding L6). This used to overwrite unconditionally, so
+             hitting 21 reps and then 20 later in the same session reported
+             "20 reps (was 14)" on the completion screen — the real 21 was
+             computed right here and thrown away one line later, same shape
+             as the comment above already warns about for the tally. Every
+             kind this row can hold is "bigger is better" (more reps, more
+             kg, a longer hold), the same direction isRecord() already
+             tests, so keeping the larger of the two is the whole fix. */
+          if (parseFloat(val) > parseFloat(existing.val)) existing.val = val;
+        } else {
+          sess.records.push({ key, exercise: entry.exercise, kind, val, prev });
+        }
+        callouts.push(`NEW BEST · ${describeRecord(kind, val, prev)}`);
+        celebrate(ctx, sess, 'record', 'new record');
+      }
+    }
+  } catch (e) { console.error('gym-vault records', e); }
+
+  try {
+    for (const g of checkGoalReached(ctx, sess, draft)) {
+      sess.goalCount++;
+      callouts.push(`GOAL HIT · ${g.name}`);
+      celebrate(ctx, sess, 'goal', 'goal met');
+    }
+  } catch (e) { console.error('gym-vault goals', e); }
+
+  syncLive(draft, sess);
+  return callouts;
+}
+
+/* How long the rest between sets runs, clamped to the dial's own range so a
+   hand-edited data.json cannot produce a rest that never ends. */
+function restSecondsFor(ctx) {
+  const n = Math.round(Number((ctx.settings || {}).guideRestSeconds));
+  if (!Number.isFinite(n)) return DEFAULT_SETTINGS.guideRestSeconds;
+  return Math.max(GUIDE_REST.min, Math.min(GUIDE_REST.max, n));
+}
+
+function completeSet(ctx, draft, sess, set, entry, values, opts) {
+  const callouts = applyCompletion(ctx, draft, sess, set, entry, values, opts);
+
+  const peek = flow.advance(draft, sess.pos);
+  resetActiveState(sess);
+  if (flow.isDone(draft, peek)) {
+    sess.pos = peek;
+    sess.phase = 'active';
+    sess.pendingPos = null;
+  } else if (restSecondsFor(ctx) <= 0) {
+    /* "Rest (if any)" — set to zero, there is none, so Done goes straight to
+       the next set. The callouts a record or a goal produced would have no
+       screen to land on, so they are announced instead of dropped. */
+    sess.pos = peek;
+    sess.phase = 'active';
+    sess.pendingPos = null;
+    for (const line of callouts) ctx.notice(line);
+  } else {
+    sess.pendingPos = peek;
+    sess.phase = 'resting';
+    sess.rest = timerState.startClock(Date.now());
+    sess.pendingCallouts = callouts;
+  }
+  ctx.rerender();
+}
+
+/* ---------- rest state ---------- */
+
+function renderRest(ctx, root, draft, sess) {
+  const nextInfo = flow.currentSet(draft, sess.pendingPos);
+
+  /* THE REST ENDS BY ITSELF. It used to count UP with no target, so it never
+     finished and every set cost two taps — Done, then Next. Counting DOWN
+     gives it a moment to be over, which is the whole of "rest, then the next
+     set, no extra Next": the rest is not skipped, it simply stops needing a
+     tap to leave.
+
+     Derived from a start stamp rather than accumulated tick by tick — a
+     counter incremented on a timer drifts, and iOS throttles background
+     timers hard enough that the drift is visible inside one rest. Same rule
+     the timed clock follows. */
+  const restTotal = restSecondsFor(ctx);
+  /* PAUSE: the rest is a clock (timer-state.js), not a bare stamp, so it can
+     be frozen. Elapsed is banked at the pause and the time spent paused is
+     never in it — the remaining time on resume is exactly what was left. */
+  if (!sess.rest) sess.rest = timerState.startClock(Date.now());
+  const remaining = () => Math.max(0, restTotal - Math.round(timerState.elapsedSeconds(sess.rest, Date.now())));
+  const elapsedEl = el('div', { class: 'gv-session-rest-clock' }, fmtSeconds(remaining()));
+  ctx.setPageInterval(() => {
+    /* Frozen: it neither counts down nor ends the rest. */
+    if (!sess.rest || sess.rest.paused) return;
+    const secs = remaining();
+    elapsedEl.textContent = fmtSeconds(secs);
+    /* At zero it advances on its own. goNext() clears the interval by
+       re-rendering the page, and the guard makes a late tick harmless. */
+    if (secs <= 0 && sess.phase === 'resting') goNext();
+  }, 1000);
+
+  const nextLabel = nextInfo
+    ? el('div', { class: 'gv-session-rest-next' },
+        el('span', { class: 'gv-kicker' }, 'Next'),
+        el('div', { class: 'gv-session-rest-nextname' }, nextInfo.entry.exercise),
+        el('div', { class: 'gv-session-rest-nextset' }, `Set ${nextInfo.setIndex + 1}/${nextInfo.entry.sets.length}`))
+    : '';
+
+  const callouts = (sess.pendingCallouts || []).length
+    ? el('div', { class: 'gv-session-callouts' }, ...(sess.pendingCallouts || []).map(line => el('div', { class: 'gv-session-callout' }, line)))
+    : '';
+
+  /* The one way out of the rest, whether the clock ran out or a thumb said
+     so — two copies of this would be two chances to leave `pendingPos`
+     behind and resume the wrong set. */
+  const goNext = () => {
+    if (sess.phase !== 'resting') return;
+    sess.pos = sess.pendingPos;
+    sess.pendingPos = null;
+    sess.pendingCallouts = [];
+    sess.phase = 'active';
+    sess.rest = null;
+    resetActiveState(sess);
+    ctx.rerender();
+  };
+
+  /* The pause control: the circuit's own button, in the circuit's control
+     row, with the same "Paused" line the hold and the circuit show. Updated in
+     place so keyboard focus stays on the button. */
+  /* A polite live region, in the page BEFORE it says anything (one filled on
+     creation is not announced), updated in place: the pause is otherwise a
+     visual-only state, the one the hold and the circuit already speak. */
+  const hintEl = el('div', { class: 'gv-rc-hint', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+  const playBtn = playButton(sess.rest.paused);
+  const paintRest = () => {
+    const paused = sess.rest.paused;
+    elapsedEl.textContent = fmtSeconds(remaining());
+    hintEl.textContent = paused ? 'Paused' : PAUSE_LINE_BLANK;
+    syncPlayButton(playBtn, paused);
+  };
+  playBtn.addEventListener('click', () => {
+    if (sess.phase !== 'resting' || !sess.rest) return;
+    sound.unlock(); // audit M-04: a gesture the next set's speech depends on
+    const now = Date.now();
+    if (sess.rest.paused) sess.rest = timerState.resumeClock(sess.rest, now);
+    else { sess.rest = timerState.pauseClock(sess.rest, now); sound.cancel(); }
+    paintRest();
+    keepLive(ctx, draft, sess);
+  });
+  paintRest();
+
+  /* Still here, and still the flood: "go now" is a real thing to want, and
+     the recommendation was to stop REQUIRING the tap, not to remove it. */
+  const nextBtn = el('button', { class: 'gv-btn-go', type: 'button' }, 'Next');
+  nextBtn.addEventListener('click', goNext);
+
+  /* Stopping early is a REST-PHASE decision — you finish a set, then decide
+     you are done — so the visible way out lives here rather than under the
+     counter, where a full-width button sits directly beneath a zone you are
+     tapping repeatedly and would be banked by a stray rep. Ghost, not a
+     second flood: Next is still what most rests end with. */
+  const finishBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-session-finish', type: 'button' },
+    ico('check'), el('span', {}, 'Finish session'));
+  finishBtn.addEventListener('click', () => finishSession(ctx, draft));
+
+  root.append(topBar(ctx, draft, null));
+  root.append(el('div', { class: 'gv-session-rest' },
+    /* The rest phase is a whole route with no other title — a heading here
+       is what tells a screen-reader user the session moved on, and what
+       ctx.nav's focus-move needs to find. */
+    el('h2', { class: 'gv-kicker gv-session-rest-title' }, 'Rest'),
+    el('div', { class: 'gv-session-rest-clock-wrap' }, ico('timer'), elapsedEl),
+    el('div', { class: 'gv-timed-controls' }, playBtn),
+    hintEl,
+    callouts,
+    nextLabel,
+    el('div', { class: 'gv-hero-action gv-session-nextwrap' }, nextBtn),
+    finishBtn,
+    el('p', { class: 'gv-microcopy' }, "Rest, don't scroll.")));
+}
+
+/* ---------- timed mode ---------- */
+
+/* Faster than once a second so the ring sweeps rather than jerks; the spoken
+   count-in and the digits are both gated on whole seconds regardless, so the
+   extra ticks cost nothing but a little arithmetic. Both numbers come from
+   countdown.js — the set-by-set gate and this interval clock count in with
+   the same cadence because they are the same countdown. */
+const TICK_MS = countdown.TICK_MS;
+
+/* Elapsed is derived from a start stamp plus whatever was banked before the
+   last pause, never accumulated tick by tick: a counter incremented on a
+   200ms timer drifts, and iOS throttles background timers hard enough that
+   the drift is visible within one session. */
+function timedElapsed(tp) {
+  return timerState.elapsedSeconds(tp, Date.now());
+}
+
+function startInterval(sess, index) {
+  const tp = sess.timed;
+  /* A PAUSE IS NOT UNDONE BY AN ARROW (audit L3-11). Skip and Previous used to
+     start a running clock on the new interval even from a pause. A paused
+     circuit stays paused, at zero, on whichever interval it moves to; Resume
+     is what starts it. The automatic advance at the end of an interval can
+     never reach here paused (the tick returns first), so a running circuit
+     is unchanged. */
+  Object.assign(tp, tp.paused ? timerState.frozenClock(0) : timerState.startClock(Date.now()));
+  tp.index = index;
+  tp.spokenAt = null;
+  tp.announcedFor = null;
+}
+
+/* What gets said out loud as an interval opens. A transition already names
+   what is coming, so the work interval that follows it stays quiet — being
+   told "Push-ups" twice in ten seconds is noise. With transitions switched
+   off there is no such announcement, so the work interval makes it itself. */
+function announcementFor(schedule, index) {
+  const iv = schedule.intervals[index];
+  if (!iv) return null;
+  if (iv.kind === 'transition') return iv.leadIn ? `Starting with ${iv.exercise}` : `Next, ${iv.exercise}`;
+  if (iv.kind === 'work') {
+    const prev = schedule.intervals[index - 1];
+    return prev && prev.kind === 'transition' ? null : iv.exercise;
+  }
+  return iv.exercise;
+}
+
+function renderTimed(ctx, root, draft, sess) {
+  const schedule = draft.timed;
+  const intervals = (schedule && schedule.intervals) || [];
+  const tp = sess.timed;
+  if (!intervals.length || tp.index >= intervals.length) { renderComplete(ctx, root, draft, sess); return; }
+  renderTimedInterval(ctx, root, draft, sess, intervals[tp.index]);
+}
+
+/* Move on. `opts.skip` leaves the set untouched and unticked — exactly what
+   skipping a set means everywhere else in this app (see session-flow.js), so
+   a skipped interval still counts only as a plan-target prefill.
+
+   `tp.completed` guards the write: stepping BACK and forward again must not
+   claim the same record twice. Back is position-only by design — it never
+   un-ticks a set, because silently undoing logged work to let you re-watch
+   an exercise is a worse surprise than the position moving. */
+function advanceTimed(ctx, draft, sess, opts) {
+  const tp = sess.timed;
+  const iv = draft.timed.intervals[tp.index];
+  const skip = !!(opts && opts.skip);
+
+  /* BEFORE applyCompletion, not after (audit L3-06): the old interval's leftover
+     "3, 2, 1" is cut here, and then a record cue that applyCompletion starts is
+     the newest thing on the floor. Cancelling afterwards cut that cue the moment
+     it began. */
+  sound.cancel();
+
+  /* A skipped work interval is remembered on its set (session-flow's
+     markSkipped), so leaving and re-entering the circuit does not offer it
+     again. It stays untouched and unticked: a skip is not a logged set. */
+  if (iv && iv.kind === 'work' && skip) {
+    flow.markSkipped(draft, { entryIndex: iv.entryIndex, setIndex: iv.setIndex });
+    keepDraft(ctx);
+  }
+
+  if (iv && iv.kind === 'work' && !skip) {
+    if (!tp.completed) tp.completed = {};
+    if (!tp.completed[tp.index]) {
+      tp.completed[tp.index] = true;
+      const entry = draft.entries[iv.entryIndex];
+      const set = entry && entry.sets && entry.sets[iv.setIndex];
+      if (entry && set) {
+        /* The clock is the one figure this screen writes (an untouched plan
+           prefill is cleared rather than promoted to observed work —
+           timed-plan.timedSetValues owns that rule, and the run's
+           minutes-not-seconds exception, so it can be tested without
+           standing up this screen). `set` is read BEFORE applyCompletion
+           sets touched, which is the only order in which "did the user type
+           this" is still answerable.
+
+           observed: [] — a timed interval watches NOTHING here, not even
+           seconds: an interval that counts down and ends on its own is a
+           SCHEDULED duration, not an observed hold (see timedFigures' seconds
+           box for a duration entry — a typed figure is what makes the hold
+           itself claimable, via typedByUser). */
+        const measured = timedPlan.timedSetValues(entry, set, iv.seconds);
+        sess.pendingCallouts = applyCompletion(ctx, draft, sess, set, entry, measured, { observed: [] });
+      }
+    }
+  }
+
+  startInterval(sess, tp.index + 1);
+  ctx.rerender();
+}
+
+function stepBack(ctx, sess) {
+  sound.cancel();
+  startInterval(sess, Math.max(0, sess.timed.index - 1));
+  ctx.rerender();
+}
+
+function timedTopBar(ctx, draft, sess, schedule, iv) {
+  const tp = sess.timed;
+  const workDone = schedule.intervals.slice(0, tp.index + 1).filter(i => i.kind === 'work').length;
+  const workTotal = timedPlan.workIntervals(schedule).length;
+  const label = iv.kind === 'work'
+    ? `Interval ${workDone}/${workTotal}${iv.round != null ? ` · Round ${iv.round + 1}` : ''}`
+    : iv.kind === 'transition' ? (iv.leadIn ? 'Get ready' : 'Next up')
+      : iv.kind === 'warmup' ? 'Warm-up' : 'Cool-down';
+
+  const ord = el('div', { class: 'gv-session-ord' }, label);
+  const bar = el('div', { class: 'gv-bar gv-session-bar' }, el('div', { class: 'gv-bar-fill gv-timed-bar-fill' }));
+  return {
+    node: el('div', { class: 'gv-session-top' },
+      el('div', { class: 'gv-session-top-row' },
+        exitButton(ctx, draft),
+        el('div', { class: 'gv-session-top-extra' }, ord),
+        musicButton(ctx) || ''),
+      bar),
+    fill: bar.firstChild,
+  };
+}
+
+function renderTimedInterval(ctx, root, draft, sess, iv) {
+  focusMode(ctx);
+  const schedule = draft.timed;
+  const tp = sess.timed;
+  const isWork = iv.kind === 'work';
+  const entry = isWork ? draft.entries[iv.entryIndex] : null;
+  const set = entry && entry.sets ? entry.sets[iv.setIndex] : null;
+
+  const top = timedTopBar(ctx, draft, sess, schedule, iv);
+  root.append(top.node);
+
+  const body = el('div', { class: `gv-session-body gv-timed gv-timed-${iv.kind}` });
+
+  /* The exercise block is the same one the set-by-set screen uses, so the
+     demonstration media animates here too. A warm-up or transition has no
+     draft entry — it passes the interval's own name and target instead,
+     which is all exerciseBlock reads. */
+  root.append(exerciseBlock(ctx, sess, entry || { exercise: iv.exercise, target: iv.target || '' }));
+
+  const ring = countdown.countdownRing(200);
+  const digits = el('div', { class: 'gv-timed-count' }, String(Math.ceil(iv.seconds)));
+  /* Announced at the START of the interval and again over the count-in, not
+     every second: a live region that fires once a second is noise, not help
+     (same rule as the hold timer's checkpoint region above). */
+  const live = el('div', { class: 'gv-sr-only', 'aria-live': 'assertive', 'aria-atomic': 'true' });
+  /* Urgency lives on the dial as an attribute, not as a class toggle per
+     tick: one attribute write when the BAND changes, and the stylesheet owns
+     every colour. Bands rather than a continuous gradient because the point
+     is to be readable at arm's length mid-set — a colour creeping by one
+     percent a tick tells you nothing, a colour that changes tells you the
+     interval is nearly out. */
+  /* A visible Paused state (the hint line the counters use) INSIDE the ring,
+     under the numeral. Without it the only sign of a pause was the button's
+     icon. In the ring because it costs no height: a line under the dial pushed
+     the controls off an iPhone SE-sized screen, and a line that appears and
+     disappears moves them. Empty (so hidden) while running. */
+  const dial = el('div', { class: 'gv-timed-dial', 'data-urgency': 'calm' }, ring.svg, digits,
+    el('div', { class: 'gv-rc-hint' }, tp.paused ? 'Paused' : ''));
+  let urgency = 'calm';
+  body.append(dial);
+
+  /* Rep, weight and (for a duration entry) seconds boxes for a work
+     interval that has them. A timer cannot count your push-ups, so the
+     plan's target sits in the box as a starting point and this is where you
+     correct it — typing marks the set touched, which is also what makes a
+     personal best claimable (see applyCompletion).
+
+     A duration entry used to be EXCLUDED here, on the assumption that the
+     countdown is the whole answer for how long a hold ran. It is not: the
+     interval counts down and ends whether or not the hold was actually kept
+     up, so the seconds box is the only way to say "I dropped it at 40s of a
+     90s plank" — and a typed figure is what makes that hold's record
+     claimable (typedByUser), where the clock alone no longer is. */
+  if (isWork && set) {
+    body.append(timedFigures(ctx, entry, set, iv));
+  } else if (iv.target) {
+    body.append(el('div', { class: 'gv-timed-target' }, iv.target));
+  }
+
+  const backBtn = el('button', { class: 'gv-icon-btn', type: 'button', 'aria-label': 'Previous interval' }, ico('skip-back'));
+  backBtn.addEventListener('click', () => stepBack(ctx, sess));
+
+  const playBtn = playButton(tp.paused);
+  playBtn.addEventListener('click', () => {
+    sound.unlock(); // audit M-04: the circuit speaks on a timer; this tap is the gesture
+    const now = Date.now();
+    if (tp.paused) { Object.assign(tp, timerState.resumeClock(tp, now)); tp.stateNote = 'Resumed'; }
+    else { Object.assign(tp, timerState.pauseClock(tp, now)); tp.stateNote = 'Paused'; sound.cancel(); }
+    ctx.rerender();
+  });
+
+  const skipBtn = el('button', { class: 'gv-icon-btn', type: 'button', 'aria-label': isWork ? 'Skip this interval' : 'Skip ahead' }, ico('skip-forward'));
+  skipBtn.addEventListener('click', () => advanceTimed(ctx, draft, sess, { skip: true }));
+
+  body.append(el('div', { class: 'gv-timed-controls' }, backBtn, playBtn, skipBtn));
+  body.append(el('div', { class: 'gv-rc-bar gv-session-rcbar' }, muteButton(ctx, sess)));
+
+  const callouts = (sess.pendingCallouts || []).length
+    ? el('div', { class: 'gv-session-callouts' }, ...(sess.pendingCallouts || []).map(line => el('div', { class: 'gv-session-callout' }, line)))
+    : '';
+  if (callouts) { body.append(callouts); }
+
+  root.append(body, live);
+
+  /* "Paused" / "Resumed", through the screen's own live region, once. */
+  if (tp.stateNote) { live.textContent = tp.stateNote; tp.stateNote = null; }
+
+  /* Announce once per interval, not once per render — a mute toggle or a
+     typed rep re-renders this screen and must not re-announce. */
+  if (tp.announcedFor !== tp.index) {
+    tp.announcedFor = tp.index;
+    const words = announcementFor(schedule, tp.index);
+    if (words) {
+      live.textContent = `${words}, ${Math.round(iv.seconds)} seconds`;
+      if (!sess.muted) sound.cue('begin', words, ctx.settings);
+    } else {
+      live.textContent = `${iv.exercise}, ${Math.round(iv.seconds)} seconds`;
+    }
+    sess.pendingCallouts = [];
+  }
+
+  const totalBefore = schedule.intervals.slice(0, tp.index).reduce((n, i) => n + i.seconds, 0);
+  /* THIS render belongs to this interval only. If the circuit has moved on
+     (tick() below ended the interval and a nested render now owns the clock),
+     a ticker still bound to these nodes must do nothing: it would read the NEW
+     interval's clock against THIS interval's length. */
+  const myIndex = tp.index;
+  const tick = () => {
+    if (tp.index !== myIndex || ctx.state.session !== sess) return;
+    const elapsed = timedElapsed(tp);
+    const remaining = Math.max(0, iv.seconds - elapsed);
+    digits.textContent = String(Math.ceil(remaining));
+    const left = iv.seconds ? remaining / iv.seconds : 0;
+    ring.set(left);
+    /* Under 40% it warms; under 15% it goes urgent and the digits get a
+       heartbeat. Both thresholds are on the FRACTION, not on seconds, so a
+       20-second interval and a 3-minute one feel the same shape. */
+    const band = left <= 0.15 ? 'urgent' : left <= 0.4 ? 'warn' : 'calm';
+    if (band !== urgency) { urgency = band; dial.setAttribute('data-urgency', band); }
+    if (schedule.totalSeconds) {
+      top.fill.style.width = `${Math.min(100, ((totalBefore + elapsed) / schedule.totalSeconds) * 100).toFixed(1)}%`;
+    }
+
+    if (tp.paused) return;
+
+    /* "3, 2, 1" into the next thing — countdown.countInNumber owns the
+       ceil-vs-floor rule so this clock and the set-by-set gate cannot come
+       to disagree about when 3 is 3. */
+    const whole = countdown.countInNumber(remaining);
+    if (whole !== null && whole !== tp.spokenAt) {
+      tp.spokenAt = whole;
+      live.textContent = String(whole);
+      if (!sess.muted) sound.announce(whole, ctx.settings, 'count');
+    }
+
+    if (remaining <= 0) advanceTimed(ctx, draft, sess);
+  };
+  tick();
+  /* An interval that was already over ended in that first tick(): advanceTimed
+     re-rendered the next one, which registered ITS ticker. Registering this
+     one now would replace it with a ticker for the interval that just ended
+     (audit L3-09). */
+  if (tp.index !== myIndex || ctx.state.session !== sess) return;
+  ctx.setPageInterval(tick, TICK_MS);
+}
+
+/* The reps (and weight) boxes shown during a timed work interval. Deliberately
+   small and off to the side: the countdown is what you are looking at, and
+   this is only there for the moment you notice you managed twelve rather than
+   the fifteen the plan asked for. */
+function timedFigures(ctx, entry, set, iv) {
+  const row = el('div', { class: 'gv-timed-figures' });
+
+  if (entry.weighted) prefillWeight(ctx, entry, set);
+
+  /* A PREFILL IS THE PLAN'S SUGGESTION, NOT A RESULT — same rule as the log
+     overview's .gv-log-set.prefill (styles.css): until this set is touched
+     its boxes hold the day's prescription, and rendering that full-ink read
+     as a logged figure. The user did exactly what the box said, never
+     touched it, and history then showed nothing — timedSetValues clears an
+     untouched value on save. Read BEFORE any field below can flip it. */
+  const prefilled = !set.touched;
+
+  const field = (key, placeholder, unit, label) => {
+    const wrap = el('div', { class: `gv-timed-field${prefilled ? ' gv-timed-prefill' : ''}` });
+    const input = numericInput({
+      class: 'gv-set-input gv-timed-input',
+      placeholder, value: set[key] ?? '',
+      'aria-label': `${label} — ${entry.exercise}`,
+    }, v => {
+      set[key] = v;
+      set.touched = true;
+      keepDraft(ctx);
+      wrap.classList.remove('gv-timed-prefill'); // typed — it reads as a result now, not a suggestion
+    });
+    wrap.append(input, el('span', { class: 'gv-set-unit' }, unit));
+    return wrap;
+  };
+
+  /* A run logs the distance you covered; the clock supplies the time on its
+     own when the interval ends, so there is no minutes box here. */
+  if (entry.distance) {
+    row.append(field('distance_km', 'km', 'km', 'Distance in kilometres'));
+  } else if (entry.duration) {
+    /* The interval counting down to zero is not proof of a held duration —
+       an elapsed clock is not an observed hold. This box is the user's own
+       word for how long they actually held it, and typing into it is what
+       makes the hold's record claimable (applyCompletion's typedByUser). */
+    row.append(field('seconds', 'sec', 's', 'Seconds held'));
+  } else {
+    row.append(field('reps', 'reps', '×', 'Reps'));
+    if (entry.weighted) row.append(field('weight_kg', 'kg', 'kg', 'Weight in kilograms'));
+  }
+  if (iv.target) row.append(el('div', { class: 'gv-timed-target' }, `target ${iv.target}`));
+  return row;
+}
+
+/* ---------- completion state ---------- */
+
+/* The XP card and the medal-unlocked card on the completion screen (rewards). */
+const rewardsUi = require('./rewards-ui');
+
+/* THE PERSONAL-BEST MOMENT: the big "12 -> 14" the completion screen leads
+   with, one per record in sess.records (so exactly the records applyCompletion
+   already detected - this builds nothing of its own to celebrate).
+
+   The old value is struck through and the arrow shown only when there IS an old
+   value; a first-ever best has nothing to be measured against, so it prints no
+   old figure, no arrow, and neither chip (a "+14 reps" from nothing, or a
+   percentage of zero, would be a made-up number). The chips come from
+   progress.pbDelta, the margin rule the record row below uses too. */
+const PB_UNIT = { reps: 'reps', weight: 'kg', seconds: 's' };
+function pbFigure(v) { const n = parseFloat(v); return Number.isFinite(n) ? String(n) : String(v); }
+
+function pbMoment(r) {
+  const unit = PB_UNIT[r.kind] || '';
+  const hasOld = r.prev !== null && r.prev !== undefined && Number.isFinite(parseFloat(r.prev));
+  const delta = pbDelta(r.prev, r.val);
+  const swap = el('div', { class: 'gv-pb-moment-swap' });
+  if (hasOld) swap.append(el('s', { class: 'gv-pb-old' }, pbFigure(r.prev)), ico('arrow-right', 'gv-pb-arrow'));
+  swap.append(el('b', { class: 'gv-pb-new' }, pbFigure(r.val)), el('small', { class: 'gv-pb-unit' }, unit));
+  const chips = el('div', { class: 'gv-pb-moment-chips' });
+  if (delta) {
+    chips.append(el('span', { class: 'gv-pb-delta' }, marginText(r.kind, delta.abs)));
+    if (delta.pct !== null) chips.append(el('span', { class: 'gv-pb-delta' }, pctText(delta.pct)));
+  }
+  return el('div', {
+    class: 'gv-pb-moment', role: 'group',
+    'aria-label': `New personal best: ${r.exercise}, ${hasOld ? `${pbFigure(r.prev)} to ` : ''}${pbFigure(r.val)} ${unit}`.trim(),
+  },
+    el('p', { class: 'gv-pb-moment-kicker' }, 'Personal best'),
+    el('h3', { class: 'gv-pb-moment-name' }, r.exercise),
+    swap,
+    chips);
+}
+
+function renderComplete(ctx, root, draft, sess) {
+  /* ONE minutes rule for a finished session (contract K5): page-log's
+     sessionMinutes, the same function finishSession writes duration_min with, so
+     this tile and the note it is about to save cannot disagree. It is looked up on
+     the module at call time and guarded because tests/session-fix-complete-screen
+     stubs page-log without it; the fallback is the rule it replaced (floored at
+     1, same as finishSession's own), and is dead code wherever sessionMinutes
+     exists. */
+  const sessionMinutes = pageLog.sessionMinutes;
+  const totalMin = typeof sessionMinutes === 'function'
+    ? sessionMinutes(draft)
+    : Math.max(1, Math.round((Date.now() - draft.startedAt) / 60000));
+  let doneSets = 0;
+  for (const entry of draft.entries) for (const set of entry.sets) if (setCounts(set)) doneSets++;
+  /* page-log.finishSession's own guard: zero saveable rows means Finish has
+     nothing to write and only notices, leaving a "Finish & save" button that
+     silently does nothing under a thumb. Discard is the honest name for
+     what tapping it here actually does — nothing was saved either way. */
+  const hasSaveableRows = doneSets > 0;
+
+  const broken = sess.records || [];
+  const wins = [];
+  if (broken.length) wins.push(`${broken.length} record${broken.length === 1 ? '' : 's'} broken`);
+  if (sess.goalCount) wins.push(`${sess.goalCount} goal${sess.goalCount === 1 ? '' : 's'} hit`);
+
+  /* The records themselves, not just how many. Each row leads with the
+     MARGIN — "+3 reps" is the thing you did; "21" is only the number it
+     landed on, and it means nothing without the 18 underneath it. */
+  const recordList = broken.length
+    ? el('div', { class: 'gv-card-list gv-session-records' },
+        ...broken.map(r => el('div', { class: 'gv-card gv-recrow' },
+          el('div', { class: 'gv-recrow-main' },
+            el('div', { class: 'gv-recrow-name' }, r.exercise),
+            el('div', { class: 'gv-recrow-was' }, describeRecord(r.kind, r.val, r.prev))),
+          el('div', { class: 'gv-recrow-margin' }, describeMargin(r.kind, r.val, r.prev)))))
+    : '';
+
+  /* Celebration stays scarce on purpose (editorial register) — an ordinary
+     session finishing is calm, never a confetti burst; fires once even if
+     this screen re-renders (e.g. a mute toggle elsewhere) while it's up. */
+  if (wins.length && !sess.completionCelebrated) {
+    sess.completionCelebrated = true;
+    celebrate(ctx, sess, null);
+  }
+
+  /* THE COMPLETION SCREEN HAD NO EXIT. No top bar, no X — the only way off it
+     was Finish (which, with nothing saveable, only notices and leaves you
+     right here) or Review. Same exit as every other phase of the session, so
+     ending up here from a mostly-skipped session is not a dead end. */
+  root.append(el('div', { class: 'gv-session-top' }, el('div', { class: 'gv-session-top-row' }, exitButton(ctx, draft))));
+
+  const primaryBtn = el('button', { class: 'gv-btn-go', type: 'button' }, hasSaveableRows ? 'Finish & save' : 'Discard');
+  primaryBtn.addEventListener('click', () => {
+    if (hasSaveableRows) finishSession(ctx, draft);
+    else { ctx.state.logDraft = null; ctx.nav('dashboard'); } // nothing was ever saveable — same as EndSessionModal's onDiscard
+  });
+
+  /* The rewards card sits between the records and the tiles. null when rewards are off. It previews what
+     "Finish & save" will pay; the XP is written by page-log.finishSession, never from here. */
+  const rewardsSlot = rewardsUi.completeSlot(ctx);
+  root.append(el('div', { class: 'gv-session-complete' },
+    el('div', { class: 'gv-session-complete-ico' }, ico('trophy')),
+    el('h2', { class: 'gv-display gv-session-complete-title' }, 'Session done'),
+    wins.length ? el('div', { class: 'gv-session-wins' }, wins.join(' · ')) : '',
+    ...broken.map(pbMoment),
+    recordList,
+    rewardsSlot || '',
+    el('div', { class: 'gv-tiles gv-session-complete-tiles' },
+      statTile(ico('check'), String(doneSets), doneSets === 1 ? 'set done' : 'sets done'),
+      statTile(ico('timer'), `${totalMin} min`, 'elapsed')),
+    el('div', { class: 'gv-hero-action gv-session-nextwrap' }, primaryBtn),
+    el('button', { class: 'gv-btn gv-btn-ghost gv-session-review', type: 'button', onclick: () => ctx.nav('log') },
+      ico('list'), el('span', {}, 'Review in log')),
+    el('p', { class: 'gv-microcopy' }, 'No zero days.')));
+  rewardsUi.mountComplete(ctx, rewardsSlot, { draft, sess, rows: buildRows(draft) });
+}
+
+/* applyCompletion and classifyKind are exported so the observed-kind trust
+   rule (findings #2/#3 of the 0.11.2 journey audit) can be exercised
+   directly, without standing up a render — same reasoning as timed-plan.js
+   pulling timedSetValues out to where it can be tested on its own.
+   renderComplete takes only (ctx, root, draft, sess) with no dependency on
+   the flow/position machinery the rest of render() needs, so findings #4
+   and #7 (the completion screen's exit and its elapsed-minutes tile) are
+   exercised the same way. */
+module.exports = { render, applyCompletion, classifyKind, renderComplete };

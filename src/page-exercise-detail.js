@@ -1,0 +1,366 @@
+'use strict';
+/* Exercise detail — the library page for one exercise: media (image or
+   video), how-to (the note body, rendered as real markdown so embeds and
+   lists work), your bests, and recent sets.
+
+   Media contract (documented in README): the exercise note's frontmatter may
+   carry `image:` and/or `video:` — either a vault path or an https URL.
+   Vault files resolve through getResourcePath (offline, synced with the
+   vault); https URLs load when online and degrade to a quiet placeholder
+   offline. Images embedded in the note body render too, via the markdown
+   pass. */
+
+const { MarkdownRenderer } = require('obsidian');
+const { el, ico, fmt, fmtSeconds, backButton, statTile } = require('./dom');
+const { claimedBests, claimableKinds, best1RM, sameName } = require('./stats');
+const { fmtShort } = require('./dates');
+const { equipmentTokens, labelFor } = require('./equipment');
+const { recordHistory, KINDS } = require('./records');
+const { openMediaViewer } = require('./media-viewer');
+const { frameLabel, autoPlayMedia } = require('./media-cycle');
+const { prefersReducedMotion } = require('./confetti');
+const { editExercise } = require('./page-exercises');
+const { mountMuscleMap, canDraw } = require('./muscle-map');
+const { motionFor, noteSteps, visualPrefs, rememberDetail } = require('./motion-library');
+
+/* The live Muscle Map on this page, if any. A re-render of this page (or a
+   move to another exercise, which is the same page) stops it before drawing
+   the next; leaving the page stops it through pageCleanup. */
+let stopDetailMap = null;
+const stopMap = () => { if (stopDetailMap) { const stop = stopDetailMap; stopDetailMap = null; stop(); } };
+
+const isUrl = v => /^https?:\/\//i.test(v || '');
+
+const KIND_TITLE = { reps: 'Best reps', weight: 'Best weight', seconds: 'Longest hold' };
+
+/* One record figure in its own unit. Same shape page-records.js uses, and
+   fmtSeconds either way, so a hold reads identically on both screens. */
+function kindFigure(kind, value) {
+  if (kind === 'seconds') return fmtSeconds(value);
+  if (kind === 'weight') return `${value} kg`;
+  return String(value);
+}
+/* A URL the <video> tag can play directly (vs. a page link like YouTube). */
+const isDirectVideo = v => /\.(mp4|m4v|mov|webm)(\?|#|$)/i.test(v || '');
+
+/* Resolve a vault media value: plain path, or the `[[wikilink]]` an
+   Obsidian user will naturally type (resolved the way Obsidian resolves
+   links, relative to the exercise note). */
+function vaultFile(ctx, value, sourcePath) {
+  const wl = (value || '').match(/^\[\[(.+?)(\|.*)?\]\]$/);
+  if (wl) return ctx.app.metadataCache.getFirstLinkpathDest(wl[1].trim(), sourcePath || '');
+  return ctx.app.vault.getFileByPath(value);
+}
+
+/* The equipment a note names, one label per item, in the app's own kit
+   wording. A note can hold a list or a comma string, so this must not hand
+   the raw value to el() (it flattens an array into adjacent text nodes:
+   "bardumbbells"). equipmentTokens drops `bodyweight` (it is not kit), but a
+   note that says ONLY that still earns its tag, as it always did. */
+function equipmentTags(value) {
+  const tokens = equipmentTokens(value);
+  if (tokens.length) return tokens.map(labelFor);
+  const raw = Array.isArray(value) ? value : String(value == null ? '' : value).split(',');
+  return raw.map(x => String(x == null ? '' : x).trim()).filter(Boolean).map(labelFor);
+}
+
+function render(ctx, root) {
+  const params = ctx.state.params || {};
+  const name = params.exercise;
+  /* Path first: it identifies the FILE, and two exercise notes in different
+     subfolders can share a name. Name is the fallback — plans, goals and
+     logged rows all reference exercises by name (that is the file format,
+     and it is hand-editable), so a name-only link must still resolve. */
+  const ex = (params.path && ctx.data.exercises.find(e => e.file.path === params.path))
+    || ctx.data.exercises.find(e => sameName(e.name, name));
+  if (!ex) { ctx.nav('exercises'); return; }
+
+  /* Toolbar */
+  /* Back to the CALLER, not to a hardcoded page. Reaching this from
+     Records used to drop you on Exercises instead of where you came from. */
+  const back = backButton(ctx, 'exercises');
+  root.append(el('div', { class: 'gv-toolbar' },
+    back,
+    el('h2', { class: 'gv-toolbar-title' }, ex.name),
+    el('div', { class: 'gv-toolbar-actions' },
+      el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small', type: 'button', onclick: () => editExercise(ctx, ex) },
+        ico('pencil'), el('span', {}, 'Edit')),
+      el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small', type: 'button', onclick: () => ctx.openFile(ex.file) },
+        ico('search'), el('span', {}, 'Note')))));
+
+  /* Tags */
+  const muscles = Array.isArray(ex.fm.muscles) ? ex.fm.muscles : ex.fm.muscles ? [ex.fm.muscles] : [];
+  root.append(el('div', { class: 'gv-chips gv-detail-tags' },
+    el('span', { class: 'gv-tag gv-tag-type' }, ex.fm.type || 'strength'),
+    ...muscles.map(m => el('span', { class: 'gv-tag' }, m)),
+    ...equipmentTags(ex.fm.equipment).map(k => el('span', { class: 'gv-tag' }, k)),
+    el('span', { class: 'gv-tag' }, `tracked in ${ex.fm.unit || 'reps'}`)));
+
+  /* Media: the Muscle Map for an exercise that has a motion (its photos one
+     tap away), the photos and video for everything else. */
+  stopMap();
+  const motion = canDraw() ? motionFor(ex) : null;
+  const map = motion ? motionBlock(ctx, ex, motion) : null;
+  if (map) root.append(map);
+  else {
+    const media = mediaBlock(ctx, ex);
+    if (media) root.append(media);
+  }
+
+  /* Bests */
+  const bests = claimedBests(ctx.data.workouts, ex);
+  /* One set's own weight and reps — never the best weight with the best reps,
+     which come from different sets (stats.best1RM says why). */
+  const orm = best1RM(ctx.data.workouts, ex.name);
+  const isRun = (ex.fm.unit || '') === 'km';
+  /* A run has no "best weight" or 1RM — showing those as dashes is noise.
+     Longest time is deliberately NOT divided by longest distance to make a
+     pace: they can come from different runs, and two figures derived by
+     different rules is exactly how this codebase grows wrong numbers. */
+  root.append(isRun
+    ? el('div', { class: 'gv-tiles' },
+        statTile(ico('trophy'), fmt(bests.distance, ' km'), 'longest run'),
+        statTile(ico('timer'), bests.seconds !== null ? fmtSeconds(bests.seconds) : '—', 'longest time'),
+        statTile(ico('chart-line'), bests.totalDistance ? `${bests.totalDistance} km` : '—', 'total logged'),
+        statTile(ico('history'), bests.lastDate ? fmtShort(bests.lastDate) : '—', 'last run'))
+    : el('div', { class: 'gv-tiles' },
+        statTile(ico('trophy'), fmt(bests.reps), 'best reps'),
+        statTile(ico('dumbbell'), fmt(bests.weight, ' kg'), 'best weight'),
+        statTile(ico('timer'), bests.seconds !== null ? fmtSeconds(bests.seconds) : '—', 'best hold'),
+        orm !== null
+          ? statTile(ico('chart-line'), `${orm} kg`, 'est. 1RM')
+          : statTile(ico('history'), bests.lastDate ? fmtShort(bests.lastDate) : '—', 'last done')));
+
+  /* THE PROGRESSION — every time a best moved, oldest first.
+
+     Not the same thing as "Recent" below it: recent sets are what you did,
+     this is only the sets that changed what you are capable of. A tile says
+     you can do 21; this says you went 10, 14, 21, and when.
+
+     Values come from records.recordHistory, which the guard suite pins to
+     agree with the exerciseBests tiles directly above — the two figures
+     sitting on one screen is exactly where a disagreement would show. */
+  if (!isRun) {
+    const progress = [];
+    const claim = claimableKinds(ex);
+    for (const kind of KINDS) {
+      /* The same gate as the tiles above and the Records page. */
+      if (!claim.includes(kind)) continue;
+      const history = recordHistory(ctx.data.workouts, ex.name, kind);
+      /* One entry is a baseline, not a progression — there is nothing to
+         show a line about. */
+      if (history.length < 2) continue;
+      progress.push({ kind, history });
+    }
+    if (progress.length) {
+      root.append(el('div', { class: 'gv-section-title' }, ico('trending-up'), el('span', {}, 'Progression')));
+      const wrap = el('div', { class: 'gv-card gv-progress' });
+      for (const { kind, history } of progress) {
+        wrap.append(el('div', { class: 'gv-set-ex' }, KIND_TITLE[kind]));
+        for (const step of history) {
+          wrap.append(el('div', { class: 'gv-set-row gv-progress-row' },
+            el('span', { class: 'gv-progress-when' }, step.date ? fmtShort(step.date) : '—'),
+            el('span', { class: 'gv-progress-val' }, kindFigure(kind, step.value)),
+            el('span', { class: 'gv-progress-prev' },
+              step.prev === null ? 'first logged' : `was ${kindFigure(kind, step.prev)}`)));
+        }
+      }
+      root.append(wrap);
+    }
+  }
+
+  /* How-to (note body as markdown) */
+  const body = (ex.body || '').trim();
+  root.append(el('div', { class: 'gv-section-title' }, ico('clipboard-list'), el('span', {}, 'How to')));
+  const howto = el('div', { class: 'gv-card gv-howto' });
+  if (!body) {
+    howto.append(el('div', { class: 'gv-dim' }, 'No instructions yet — add them to the note (steps, cues, anything).'));
+  } else if (MarkdownRenderer && MarkdownRenderer.render) {
+    MarkdownRenderer.render(ctx.app, body, howto, ex.file ? ex.file.path : '', ctx.view)
+      .catch(e => { console.error('gym-vault howto render', e); howto.append(el('div', {}, body)); });
+  } else {
+    for (const para of body.split(/\n\s*\n/)) howto.append(el('p', {}, para));
+  }
+  root.append(howto);
+
+  /* Recent sets */
+  const recent = recentSessions(ctx.data.workouts, ex.name, 5);
+  if (recent.length) {
+    root.append(el('div', { class: 'gv-section-title' }, ico('history'), el('span', {}, 'Recent')));
+    const listEl = el('div', { class: 'gv-card gv-set-table gv-detail-recent' });
+    for (const r of recent) {
+      listEl.append(el('div', { class: 'gv-set-ex' }, `${fmtShort(r.date)}${r.day ? ` · ${r.day}` : ''}`));
+      listEl.append(el('div', { class: 'gv-set-row' }, el('span', {}, r.summary)));
+    }
+    root.append(listEl);
+  }
+}
+
+/* Resolve an exercise's `image:` frontmatter into displayable frames —
+   [{src, tag}], in order. Shared with page-session.js (the guided view) so
+   both pages agree on vault-path / wikilink / https resolution and the
+   free-exercise-db two-frame (start→finish) convention; unresolvable entries
+   are simply dropped, same as the DOM callers that render them. DOM building
+   (the actual <img> nodes, their offline error handling) stays local to each
+   caller — this only resolves URLs. */
+function resolveExerciseImages(ctx, ex) {
+  const images = (Array.isArray(ex.fm.image) ? ex.fm.image : ex.fm.image ? [ex.fm.image] : [])
+    .map(s => s.toString().trim()).filter(Boolean);
+  /* Notes seeded before multi-frame support hold only the 0.jpg of a
+     free-exercise-db pair; derive the finish frame instead of asking anyone
+     to migrate files. A missing sibling just drops (unresolvable → filtered
+     below, same as any other dead link). */
+  if (images.length === 1 && /^https:\/\/raw\.githubusercontent\.com\/yuhonas\/free-exercise-db\/.+\/0\.jpg$/.test(images[0])) {
+    images.push(images[0].replace(/0\.jpg$/, '1.jpg'));
+  }
+  const srcPath = ex.file ? ex.file.path : '';
+  const pair = images.length === 2; // the classic start/finish pair
+  const out = [];
+  images.forEach((image, i) => {
+    const src = isUrl(image)
+      ? image
+      : (() => { const f = vaultFile(ctx, image, srcPath); return f ? ctx.app.vault.getResourcePath(f) : null; })();
+    if (!src) return;
+    out.push({ src, tag: pair ? (i === 0 ? 'start' : 'finish') : String(i + 1) });
+  });
+  return out;
+}
+
+function mediaBlock(ctx, ex) {
+  const images = resolveExerciseImages(ctx, ex);
+  const video = (ex.fm.video || '').toString().trim();
+  if (!images.length && !video) return null;
+  const wrap = el('div', { class: 'gv-card gv-media' });
+
+  /* Vault video files and direct remote media both get a real player;
+     anything else video-shaped (a YouTube page, say) gets a link button. A
+     remote stream that errors (offline, moved) swaps to the button. */
+  const srcPath = ex.file ? ex.file.path : '';
+  const videoSrc = !video ? null
+    : isUrl(video) ? (isDirectVideo(video) ? video : null)
+    : (() => { const f = vaultFile(ctx, video, srcPath); return f ? ctx.app.vault.getResourcePath(f) : null; })();
+  if (videoSrc) {
+    const player = el('video', { class: 'gv-media-video', src: videoSrc, controls: '', playsinline: '', preload: 'metadata' });
+    player.addEventListener('error', () => {
+      player.replaceWith(isUrl(video) ? watchBtn(video) :
+        el('div', { class: 'gv-media-missing' }, ico('play'), el('span', {}, 'Video unavailable')));
+    });
+    wrap.append(player);
+  }
+  if (images.length) {
+    const frames = el('div', { class: 'gv-media-frames' });
+    const pair = images.length === 2 && images[0].tag === 'start'; // the classic start/finish pair
+    let alive = images.length; // resolveExerciseImages already dropped anything unresolvable
+    /* The frames still on the page, in order: what the viewer is given, so a
+       tile that already failed is not offered and the tapped one is re-found. */
+    const liveFrames = images.slice();
+    const st = ctx.settings || {};
+    images.forEach(entry => {
+      const { src, tag } = entry;
+      const label = frameLabel(images, images.indexOf(entry));
+      const frame = el('div', { class: 'gv-media-frame', role: 'button', tabindex: '0', 'aria-label': `Show ${ex.name} — ${label} larger` },
+        el('img', { class: 'gv-media-img', src, alt: `${ex.name} — ${pair ? tag + ' position' : `view ${tag}`}`, loading: 'lazy' }),
+        el('span', { class: 'gv-media-frame-tag' }, tag),
+        el('span', { class: 'gv-media-expand', 'aria-hidden': 'true' }, ico('maximize-2')));
+      /* Tap a frame to look at it full screen (media-viewer.js), opening on
+         that frame. */
+      const openViewer = () => openMediaViewer(ctx.app, {
+        name: ex.name, frames: liveFrames, startIndex: liveFrames.indexOf(entry),
+        skin: st.skin || 'apex', accent: st.accent || 'lime', settings: st, returnFocus: frame,
+      });
+      frame.addEventListener('click', openViewer);
+      frame.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault(); // ' ' must not also scroll the page
+        openViewer();
+      });
+      /* Offline / dead link: drop the frame quietly; one placeholder for the
+         whole row once every frame has failed — never a broken-image glyph. */
+      frame.querySelector('img').addEventListener('error', () => {
+        frame.remove();
+        liveFrames.splice(liveFrames.indexOf(entry), 1);
+        if (--alive <= 0 && frames.isConnected) {
+          frames.replaceWith(el('div', { class: 'gv-media-missing' }, ico('dumbbell'), el('span', {}, 'Images unavailable offline')));
+        }
+      });
+      frames.append(frame);
+    });
+    if (frames.childNodes.length) wrap.append(frames);
+  }
+  if (video && isUrl(video) && !isDirectVideo(video)) wrap.append(watchBtn(video));
+  return wrap.childNodes.length ? wrap : null;
+}
+
+/* THE MUSCLE MAP ON THE EXERCISE PAGE, in place of the photo row. It carries its
+   own Basic/Detailed switch; a tap on it (or the corner badge) opens the viewer
+   on the map, large; "Photos" opens the same viewer on the originals. An
+   exercise whose only media is a video keeps that one reachable inline, since
+   the viewer shows images. A map that cannot build returns null and the page
+   shows its photos exactly as before. */
+function motionBlock(ctx, ex, motion) {
+  const block = el('div', { class: 'gv-mm-block' });
+  const wrap = el('div', { class: 'gv-card gv-mm-card' });
+  const extra = el('div', { class: 'gv-mm-photos-host' });
+  block.append(wrap, extra);
+  const prefs = visualPrefs(ctx.settings), st = ctx.settings || {};
+  const images = resolveExerciseImages(ctx, ex);
+  const video = (ex.fm.video || '').toString().trim();
+  const steps = noteSteps(ex.body);
+  const onDetail = d => rememberDetail(ctx, d);
+  const openViewer = (start, returnFocus) => openMediaViewer(ctx.app, {
+    name: ex.name, frames: images, startIndex: 0, skin: st.skin || 'apex', accent: st.accent || 'lime', settings: st,
+    returnFocus: returnFocus || null, start, muscleMap: { ex, motion, steps, onDetail },
+  });
+  try {
+    stopDetailMap = mountMuscleMap(wrap, {
+      ex, motion, detail: prefs.detail, body: prefs.body, steps, slot: 'detail', onDetail,
+      autoPlay: autoPlayMedia(st, prefersReducedMotion()),
+      onEnlarge: () => openViewer('map', wrap.querySelector('.gv-mm-stage')),
+    });
+  } catch (e) {
+    console.error('gym-vault muscle map', e);
+    stopDetailMap = null;
+    return null;
+  }
+  ctx.state.pageCleanup = stopMap;
+
+  if (images.length || video) {
+    let shown = null;
+    const label = el('span', {}, images.length ? 'Photos' : 'Video');
+    const btn = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small gv-mm-photos', type: 'button' }, ico(images.length ? 'image' : 'play'), label);
+    btn.addEventListener('click', () => {
+      if (images.length) { openViewer('photos', btn); return; }
+      /* video only: built when asked for, so a page that never opens it never loads it */
+      if (shown) { shown.remove(); shown = null; } else { shown = mediaBlock(ctx, ex); if (shown) extra.append(shown); }
+      btn.setAttribute('aria-expanded', String(!!shown));
+      label.textContent = shown ? 'Hide video' : 'Video';
+    });
+    wrap.append(btn);
+  }
+  return block;
+}
+
+function watchBtn(url) {
+  const btn = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small gv-media-watch', type: 'button' },
+    ico('play'), el('span', {}, 'Watch video'));
+  btn.addEventListener('click', () => window.open(url));
+  return btn;
+}
+
+function recentSessions(workouts, exercise, n) {
+  const out = [];
+  for (let i = workouts.length - 1; i >= 0 && out.length < n; i--) {
+    const w = workouts[i];
+    const sets = (w.rows || []).filter(r => sameName(r.exercise, exercise));
+    if (!sets.length) continue;
+    const summary = sets.map(r => {
+      if (r.distance_km) return `${r.distance_km} km${r.seconds ? ' · ' + fmtSeconds(r.seconds) : ''}`;
+      if (r.seconds) return fmtSeconds(r.seconds);
+      return r.weight_kg ? `${r.reps || '?'}×${r.weight_kg}kg` : `${r.reps || '?'}`;
+    }).join('  ·  ');
+    out.push({ date: w.fm.date || '', day: w.fm.day || '', summary });
+  }
+  return out;
+}
+
+module.exports = { render, resolveExerciseImages };
