@@ -1,0 +1,128 @@
+'use strict';
+/* ============================================================================
+   GYM VAULT — Obsidian plugin (entry point)
+   Dashboard, exercises, plans, goals, history and profile for training kept
+   as plain markdown in the vault. Vault API only — desktop and iOS/Android.
+
+   Source lives in src/ as plain-JS CommonJS modules; esbuild bundles them
+   into the single main.js Obsidian loads (target safari15 — the real engine
+   floor on mobile, not minAppVersion).
+   ============================================================================ */
+
+const { Plugin, normalizePath, Notice } = require('obsidian');
+const { VIEW_TYPE, DEFAULT_SETTINGS } = require('./constants');
+const { GymView } = require('./view');
+const { GymSettingTab } = require('./settings-tab');
+const { RepCounterModal } = require('./rep-counter-modal');
+const { weekdayKey, todayISO } = require('./dates');
+
+class GymPlugin extends Plugin {
+  async onload() {
+    await this.loadSettings();
+    this._lastWrite = 0; // shared write-guard timestamp (see data.js / controller.js)
+    /* Per-path own-write record: data.js stamps every path it writes, the
+       controller's vault watcher skips an event only for a path in here. */
+    this._ownWrites = new Map();
+
+    this.registerView(VIEW_TYPE, leaf => new GymView(leaf, this));
+    this.addRibbonIcon('layout-dashboard', 'Open Personal Vault', () => this.activateView());
+    this.addCommand({ id: 'open-gym', name: 'Open Personal Vault', callback: () => this.activateView() });
+    this.addCommand({
+      id: 'log-workout',
+      name: "Log today's workout",
+      callback: async () => {
+        await this.activateView();
+        this.forEachView(ctl => {
+          const { plan, day } = GymPlugin.logTargetFor(ctl.ctx);
+          ctl.ctx.startLog(plan, day);
+        });
+      },
+    });
+    this.addCommand({
+      id: 'open-rep-counter',
+      name: 'Open rep counter',
+      callback: () => {
+        new RepCounterModal(this.app, {
+          exerciseName: '',
+          skin: this.settings.skin,
+          accent: this.settings.accent,
+          settings: this.settings,
+          onDone: count => new Notice(`Gym: counted ${count} rep${count === 1 ? '' : 's'}.`, 5000),
+        }).open();
+      },
+    });
+    this.addCommand({
+      id: 'record-voice',
+      name: 'Record your own count-in',
+      callback: () => this.openPage('voice'),
+    });
+    this.addSettingTab(new GymSettingTab(this.app, this));
+
+    if (this.settings.openOnStartup) {
+      this.app.workspace.onLayoutReady(() => {
+        if (!this.app.workspace.getLeavesOfType(VIEW_TYPE).length) this.activateView();
+      });
+    }
+
+    /* Silent adoption: an existing gym folder on a fresh install (new device,
+       restored sync) just works — no setup screen. Truly-empty installs see
+       the in-view setup card instead when they first open the gym. */
+    if (!this.settings.onboarded) {
+      this.app.workspace.onLayoutReady(async () => {
+        if (this.hasGymData()) {
+          this.settings.onboarded = true;
+          try { await this.saveSettings(); } catch (e) { console.error('gym-vault adopt', e); }
+        }
+      });
+    }
+  }
+
+  hasGymData() {
+    const root = normalizePath(this.settings.gymFolder || 'Gym');
+    const v = this.app.vault;
+    return !!v.getFileByPath(`${root}/Profile.md`) || !!v.getFolderByPath(`${root}/Exercises`);
+  }
+
+  forEachView(fn) {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      if (leaf.view && leaf.view.appCtl) fn(leaf.view.appCtl);
+    }
+  }
+
+  refreshViews() { this.forEachView(ctl => ctl.reload()); }
+
+  /* Open the gym and land on one of its pages — the settings tab's "Open
+     the recorder" button and the command palette both need this. */
+  async openPage(page, params) {
+    await this.activateView();
+    this.forEachView(ctl => ctl.ctx.nav(page, params));
+  }
+
+  async activateView() {
+    const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+    if (existing.length) { this.app.workspace.revealLeaf(existing[0]); return; }
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() { await this.saveData(this.settings); }
+}
+
+/* WHAT "Log today's workout" OPENS. The first entry of ctx.daysOn for today -
+   the rule Today's hero uses (controller.resolveDaysOn: the active plan's own
+   day, then its `(any)` day, then parallel plans, then a fallback), so the
+   command and the screen cannot disagree about what today is. It used to look
+   in the active plan's days by weekday alone, so on a run or rest day it
+   opened an empty log named after the strength plan. Nothing scheduled is a
+   plain freestyle log, with no plan name that would be wrong. */
+GymPlugin.logTargetFor = (ctx, iso) => {
+  const hit = ctx.daysOn(weekdayKey(iso || todayISO()))[0];
+  return hit ? { plan: hit.plan, day: hit.day } : { plan: null, day: null };
+};
+
+module.exports = GymPlugin;
