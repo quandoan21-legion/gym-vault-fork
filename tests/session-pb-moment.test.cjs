@@ -22,7 +22,7 @@ const stub = {
   normalizePath: p => p, requestUrl: async () => ({}), Platform: { isMobile: false },
 };
 const motionStub = { motionAvailable: () => false, startMotionCounter: async () => () => {} };
-const pageLogStub = { buildRows: () => [], finishSession: () => {}, keepDraft: () => {} };
+const pageLogStub = { buildRows: () => [], finishSession: () => {}, bankSession: () => {}, keepDraft: () => {} };
 const origLoad = Module._load;
 Module._load = (req, ...rest) => {
   if (req === 'obsidian') return stub;

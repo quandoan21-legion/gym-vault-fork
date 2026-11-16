@@ -32,7 +32,7 @@ const { motionAvailable, startMotionCounter } = require('./motion-source');
 const { sensitivityKey, motionKey, motionPref, initialMotion, chooseMotion, motionFailureCopy } = require('./motion-count');
 const { resolveExerciseImages } = require('./page-exercise-detail');
 const pageLog = require('./page-log');
-const { buildRows, finishSession, keepDraft, saveMotionPref } = pageLog;
+const { buildRows, finishSession, bankSession, keepDraft, saveMotionPref } = pageLog;
 const { EndSessionModal } = require('./modals');
 const { nextFrameIndex, autoPlayMedia, MEDIA_CYCLE_MS } = require('./media-cycle');
 const { openMediaViewer } = require('./media-viewer');
@@ -285,7 +285,7 @@ function commitLiveSet(ctx, draft) {
    `review` keeps the old behaviour available as one of the three answers. */
 function endSession(ctx, draft, { review } = {}) {
   new EndSessionModal(ctx.app, {
-    onSave: () => { commitLiveSet(ctx, draft); return finishSession(ctx, draft); },
+    onSave: () => { commitLiveSet(ctx, draft); return bankSession(ctx, draft); },
     onDiscard: () => { ctx.state.logDraft = null; ctx.nav('dashboard'); },
     onReview: review ? () => { commitLiveSet(ctx, draft); ctx.nav('log'); } : null,
   }).open();
@@ -2069,7 +2069,7 @@ function renderRest(ctx, root, draft, sess) {
      second flood: Next is still what most rests end with. */
   const finishBtn = el('button', { class: 'gv-btn gv-btn-ghost gv-session-finish', type: 'button' },
     ico('check'), el('span', {}, 'Finish session'));
-  finishBtn.addEventListener('click', () => finishSession(ctx, draft));
+  finishBtn.addEventListener('click', () => bankSession(ctx, draft));
 
   root.append(topBar(ctx, draft, null));
   root.append(el('div', { class: 'gv-session-rest' },
@@ -2515,7 +2515,7 @@ function renderComplete(ctx, root, draft, sess) {
 
   const primaryBtn = el('button', { class: 'gv-btn-go', type: 'button' }, hasSaveableRows ? 'Finish & save' : 'Discard');
   primaryBtn.addEventListener('click', () => {
-    if (hasSaveableRows) finishSession(ctx, draft);
+    if (hasSaveableRows) bankSession(ctx, draft);
     else { ctx.state.logDraft = null; ctx.nav('dashboard'); } // nothing was ever saveable — same as EndSessionModal's onDiscard
   });
 

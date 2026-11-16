@@ -268,6 +268,7 @@ async function boot(opts) {
     scaffold: async () => { scaffolds++; },
     loadAll: async () => { loads++; return Object.assign(makeData(o), o.data || {}); },
     saveWorkout: async w => { saved.push(JSON.parse(JSON.stringify(w))); if (o.saveDelayMs) await new Promise(r => setT(r, o.saveDelayMs)); },
+    appendBodyRow: o.appendBodyRow || (async () => {}),
     saveExercise: o.saveExercise || (async () => {}),
     listVoiceClips: async () => [],
     readVoiceClip: async () => new ArrayBuffer(0),

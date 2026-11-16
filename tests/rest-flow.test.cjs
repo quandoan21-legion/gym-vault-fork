@@ -137,8 +137,8 @@ const { DEFAULT_SETTINGS, GUIDE_REST } = require('../src/constants');
   const src = strip(read('page-session.js'));
   assert.match(src, /gv-session-finish/,
     'the rest screen must still offer Finish — skipping the rest of a session and banking it is the same moment');
-  assert.match(src, /finishBtn\.addEventListener\('click', \(\) => finishSession\(ctx, draft\)\)/,
-    'and it must bank, not merely navigate');
+  assert.match(src, /finishBtn\.addEventListener\('click', \(\) => bankSession\(ctx, draft\)\)/,
+    'and it must bank (via bankSession, which requires a weigh-in), not merely navigate');
 }
 
 console.log('rest flow OK (Done rests then moves on by itself; skipping says so; Next and Finish both stay)');

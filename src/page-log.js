@@ -110,7 +110,7 @@ function render(ctx, root) {
      every route off this page, including the one people take to KEEP a
      workout, read as throwing it away. */
   const endSheet = () => new EndSessionModal(ctx.app, {
-    onSave: () => finishSession(ctx, draft),
+    onSave: () => bankSession(ctx, draft),
     onDiscard: () => { ctx.state.logDraft = null; ctx.nav('dashboard'); },
   }).open();
 
@@ -165,17 +165,18 @@ function render(ctx, root) {
     el('span', {}, 'Reps', el('b', {}, String(doneReps))),
     el('span', {}, 'Elapsed', el('b', { class: 'gv-log-elapsed' }, elapsed(draft)))));
 
-  /* Optional weigh-in: banking the session logs this to the Body Log as
-     today's dated row (finishSession reads draft.bodyWeight). Lives on the
-     draft so it survives rerenders and the hop into guided mode. */
+  /* REQUIRED weigh-in: banking the session logs this to the Body Log as
+     today's dated row (finishSession reads draft.bodyWeight), and bankSession
+     will not let you bank without it. Lives on the draft so it survives
+     rerenders and the hop into guided mode. */
   const bwInput = numericInput({
     class: 'gv-set-input', value: draft.bodyWeight || '', placeholder: 'kg',
-    'aria-label': 'Body weight in kilograms, logged when you bank the session',
+    'aria-label': 'Body weight in kilograms, required to bank the session',
   }, v => { draft.bodyWeight = v; });
   root.append(el('label', { class: 'gv-log-bw-row' },
-    el('span', { class: 'gv-log-bw-label' }, 'Body weight (kg)'), bwInput));
+    el('span', { class: 'gv-log-bw-label' }, 'Body weight (kg) · required'), bwInput));
 
-  const finish = el('button', { class: 'gv-btn-finish', type: 'button', onclick: () => finishSession(ctx, draft) },
+  const finish = el('button', { class: 'gv-btn-finish', type: 'button', onclick: () => bankSession(ctx, draft) },
     el('span', {}, 'Bank it'));
   /* This button IS the destructive route, so its own confirm may say so —
      what was wrong was the SHEET that every exit shared being titled that
@@ -486,6 +487,24 @@ function sessionMinutes(draft, now = Date.now()) {
   return Math.max(1, Math.round(elapsedMin), Math.round(workSec / 60));
 }
 
+/* Banking requires a body-weight reading (the user asked to be stopped here).
+   The weigh-in field lives on the log screen, but the live/guided session and
+   the end-session sheet bank without it on screen — so this gate catches every
+   route: no valid weight yet → ask for it, then bank. finishSession itself
+   stays a pure save (every test that drives it directly still banks), so the
+   requirement is a UI gate, not a change to how a session is written. */
+function bankSession(ctx, draft) {
+  const n = parseFloat(String((draft && draft.bodyWeight) || '').trim());
+  if (Number.isFinite(n) && n > 0) return finishSession(ctx, draft);
+  new FormModal(ctx.app, {
+    title: 'Body weight',
+    fields: [{ key: 'bw', label: 'Body weight (kg)', kind: 'number', value: (draft && draft.bodyWeight) || '', placeholder: 'kg' }],
+    submitLabel: 'Bank it',
+    validate: v => { const w = parseFloat(v.bw); return (Number.isFinite(w) && w > 0) ? null : 'Enter your body weight (kg) to bank.'; },
+    onSubmit: v => { draft.bodyWeight = String(v.bw).trim(); return finishSession(ctx, draft); },
+  }).open();
+}
+
 async function finishSession(ctx, draft) {
   /* stats.setCounts is the one rule for what gets saved: ticked done OR
      holding any typed figure — sweaty thumbs forget ticks, and silently
@@ -528,4 +547,4 @@ async function finishSession(ctx, draft) {
   ctx.reload();
 }
 
-module.exports = { render, startDraft, buildRows, finishSession, sessionMinutes, keepDraft, saveMotionPref };
+module.exports = { render, startDraft, buildRows, finishSession, bankSession, sessionMinutes, keepDraft, saveMotionPref };

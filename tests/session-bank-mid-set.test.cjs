@@ -51,7 +51,7 @@ const savedOnce = b => { assert.strictEqual(b.saved.length, 1, `expected one sav
 (async () => {
   await check('1. 12 taps, X, Bank it -> a row with reps=12', async () => {
     const b = await twelveOnScreen();
-    await openSheet(b.ctx).opts.onSave();
+    b.ctx.state.logDraft.bodyWeight = '80'; await openSheet(b.ctx).opts.onSave();
     const reps = savedOnce(b).rows.filter(r => r.exercise === 'Push-ups').map(r => r.reps);
     assert.deepStrictEqual(reps, ['10', '12'], `saved push-up reps ${JSON.stringify(reps)} — the 12 on screen must be the second set`);
   });
@@ -104,7 +104,7 @@ const savedOnce = b => { assert.strictEqual(b.saved.length, 1, `expected one sav
     H.click(H.byText(H.page(b.ctx), 'Done'));
     H.advance(5420 + 50000);
     assert.strictEqual(H.countText(b.ctx), '50s', 'fixture: a 50 s hold on screen');
-    await openSheet(b.ctx).opts.onSave();
+    b.ctx.state.logDraft.bodyWeight = '80'; await openSheet(b.ctx).opts.onSave();
     const plank = savedOnce(b).rows.find(r => r.exercise === 'Plank');
     assert.ok(plank, `no Plank row saved: ${JSON.stringify(rowsOf(b))}`);
     assert.strictEqual(String(plank.seconds), '50', `plank seconds ${JSON.stringify(plank.seconds)}`);
@@ -151,7 +151,7 @@ const savedOnce = b => { assert.strictEqual(b.saved.length, 1, `expected one sav
     for (let i = 0; i < 10; i++) { H.tapZone(z); H.advance(800); }
     H.click(H.byText(H.page(b.ctx), 'Done'));
     assert.ok(H.page(b.ctx).querySelector('.gv-session-rest'), 'fixture: resting');
-    await openSheet(b.ctx).opts.onSave();
+    b.ctx.state.logDraft.bodyWeight = '80'; await openSheet(b.ctx).opts.onSave();
     assert.deepStrictEqual(savedOnce(b).rows.map(r => r.reps), ['10']);
   });
 
@@ -160,7 +160,7 @@ const savedOnce = b => { assert.strictEqual(b.saved.length, 1, `expected one sav
     H.advance(6000);
     /* typeCountButton's `set` writes sess.counter exactly like this */
     b.ctx.state.session.counter = { count: 17, lastTapAt: b.ctx.state.session.counter.lastTapAt };
-    await openSheet(b.ctx).opts.onSave();
+    b.ctx.state.logDraft.bodyWeight = '80'; await openSheet(b.ctx).opts.onSave();
     assert.strictEqual(savedOnce(b).rows[0].reps, '17');
   });
 

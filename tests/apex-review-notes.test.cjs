@@ -48,7 +48,7 @@ const origLoad = Module._load;
 Module._load = (req, ...rest) => {
   if (req === 'obsidian') return stub;
   if (req === './motion-source') return { motionAvailable: () => false, startMotionCounter: async () => () => {} };
-  if (req === './page-log') return { buildRows: () => [], finishSession: () => {}, keepDraft: () => {} };
+  if (req === './page-log') return { buildRows: () => [], finishSession: () => {}, bankSession: () => {}, keepDraft: () => {} };
   return origLoad(req, ...rest);
 };
 const mkNode = tag => {

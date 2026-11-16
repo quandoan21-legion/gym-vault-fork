@@ -126,8 +126,8 @@ const strip = s => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '
   const src = strip(read('page-session.js'));
   assert.match(src, /gv-session-finish/,
     'the rest phase must carry a visible Finish — ending early is a rest-phase decision');
-  assert.match(src, /finishBtn\.addEventListener\('click',\s*\(\)\s*=>\s*finishSession\(ctx,\s*draft\)\)/,
-    'that Finish must bank the session, not merely navigate');
+  assert.match(src, /finishBtn\.addEventListener\('click',\s*\(\)\s*=>\s*bankSession\(ctx,\s*draft\)\)/,
+    'that Finish must bank the session (via bankSession, which requires a weigh-in), not merely navigate');
   assert.match(src, /new EndSessionModal\(/,
     'the live screen exit must go through the End session sheet');
   assert.ok(!/'aria-label':\s*'Exit to overview'/.test(src),

@@ -76,6 +76,7 @@ const sessionCard = ctx => /Session in progress/.test(H.page(ctx).textContent);
     assert.ok(b.ctl.hasDraft(), 'precondition: the draft is offered back');
     b.ctx.resumeDraft();
     assert.strictEqual(b.ctx.state.page, 'log');
+    b.ctx.state.logDraft.bodyWeight = '80'; // banking now requires a weigh-in
     H.click(H.byText(H.page(b.ctx), 'Bank it'));
     await H.flush();
     assert.strictEqual(b.saved.length, 1, 'the restored session must save through the normal Finish');
@@ -170,6 +171,7 @@ const sessionCard = ctx => /Session in progress/.test(H.page(ctx).textContent);
     assert.deepStrictEqual(Object.keys(r).sort(), ['date', 'day', 'entries', 'plan', 'startedAt']);
     b.ctx.resumeDraft();
     assert.strictEqual(b.ctx.state.page, 'log');
+    b.ctx.state.logDraft.bodyWeight = '80'; // banking now requires a weigh-in
     H.click(H.byText(H.page(b.ctx), 'Bank it'));
     await H.flush();
     assert.strictEqual(b.saved.length, 1, 'and Finish works on it (a restored finishing flag would have swallowed this tap)');

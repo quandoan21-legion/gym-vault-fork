@@ -158,6 +158,7 @@ const PLANK2 = '## D (any)\n\n- Plank | 2 x 60s\n';
     holdTo(b, 12);
     H.click(pauseBtn(b)); H.advance(300000);
     H.click(H.byLabel(H.page(b.ctx), 'End session'));
+    b.ctx.state.logDraft.bodyWeight = '80'; // banking now requires a weigh-in
     await H.modals.at(-1).opts.onSave();
     const plank = b.saved[0].rows.find(r => r.exercise === 'Plank');
     assert.strictEqual(String(plank.seconds), '12', `saved ${JSON.stringify(plank && plank.seconds)}`);

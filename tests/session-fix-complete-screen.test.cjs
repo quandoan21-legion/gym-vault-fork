@@ -36,6 +36,9 @@ const finishCalls = [];
 const pageLogStub = {
   buildRows: () => [],
   finishSession: (ctx, draft) => { finishCalls.push(draft); },
+  /* The completion button banks via bankSession now (it gates on a weigh-in
+     before calling finishSession); count those calls the same way. */
+  bankSession: (ctx, draft) => { finishCalls.push(draft); },
 };
 
 const origLoad = Module._load;
