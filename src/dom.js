@@ -209,6 +209,67 @@ function sparkline(points, w, h, label) {
   return svg;
 }
 
+/* A readable line chart: y gridlines with values, dated x labels, and a dot
+   per reading. sparkline() is the bare trend line; this is the "show me the
+   numbers" version used for the body-weight log. points: [{date, value}].
+   The viewBox keeps a fixed aspect and the SVG scales uniformly (CSS width
+   100%, height auto), so it fills the card without the squashing a fixed
+   pixel height forced on the sparkline — and the labels stay crisp. */
+function lineChart(points, w, h, label) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('class', 'gv-chart');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', label || 'Trend');
+  if (!points || points.length < 2) return svg;
+  const mk = (tag, attrs, text) => {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const PL = 46, PR = 16, PT = 16, PB = 30;
+  const vals = points.map(p => p.value);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const rawSpan = hi - lo;
+  const pad = rawSpan ? rawSpan * 0.2 : Math.max(0.5, Math.abs(hi) * 0.02);
+  lo -= pad; hi += pad;
+  const span = hi - lo || 1;
+  const x0 = PL, x1 = w - PR, y0 = PT, y1 = h - PB;
+  const px = i => x0 + (i / (points.length - 1)) * (x1 - x0);
+  const py = v => y1 - ((v - lo) / span) * (y1 - y0);
+  const fmt1 = v => String(Math.round(v * 10) / 10);
+  /* y gridlines + value labels (top / middle / bottom of the padded range) */
+  for (const t of [hi, (lo + hi) / 2, lo]) {
+    const y = py(t);
+    svg.appendChild(mk('line', { x1: x0, y1: y.toFixed(1), x2: x1, y2: y.toFixed(1), class: 'gv-chart-grid' }));
+    svg.appendChild(mk('text', { x: x0 - 6, y: (y + 4).toFixed(1), class: 'gv-chart-ylabel' }, fmt1(t)));
+  }
+  /* x date labels — all of them when few, thinned to ~6 when many */
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const shortDate = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || '')); return m ? `${+m[3]} ${MON[+m[2] - 1]}` : ''; };
+  const step = points.length > 6 ? Math.ceil(points.length / 6) : 1;
+  points.forEach((p, i) => {
+    const lastI = i === points.length - 1;
+    if (i % step && !lastI) return;
+    svg.appendChild(mk('text', {
+      x: px(i).toFixed(1), y: (h - 10).toFixed(1), class: 'gv-chart-xlabel',
+      'text-anchor': i === 0 ? 'start' : lastI ? 'end' : 'middle',
+    }, shortDate(p.date)));
+  });
+  /* the trend line + a dot per reading */
+  const d = points.map((p, i) => `${i ? 'L' : 'M'}${px(i).toFixed(1)},${py(p.value).toFixed(1)}`).join(' ');
+  svg.appendChild(mk('path', { d, class: 'gv-spark-line' }));
+  points.forEach((p, i) => svg.appendChild(mk('circle', {
+    cx: px(i).toFixed(1), cy: py(p.value).toFixed(1), r: i === points.length - 1 ? 4 : 3, class: 'gv-spark-dot',
+  })));
+  /* label the latest reading above its dot */
+  const lastV = vals[vals.length - 1];
+  svg.appendChild(mk('text', { x: (px(points.length - 1)).toFixed(1), y: (py(lastV) - 9).toFixed(1), class: 'gv-chart-vlabel', 'text-anchor': 'end' }, fmt1(lastV)));
+  return svg;
+}
+
 /* ---- Plan prose -------------------------------------------------------
    Plan intros are long-form coaching copy. Rendering them as
    `lines.join(' ')` flattened blank lines AND bullet lines into one
@@ -571,5 +632,5 @@ function statTile(icon, big, label, extraClass) {
 const emptyLine = (...kids) => el('div', { class: 'gv-empty-line' }, ...kids);
 
 module.exports = {
-  backButton, numericInput, normaliseNumber, el, ico, clickableCard, focusOpener, restoreFocus, toggleRow, clear, fmt, fmtSeconds, ring, sparkline, paragraphs, chunks, prose, segmented, statTile, emptyLine
+  backButton, numericInput, normaliseNumber, el, ico, clickableCard, focusOpener, restoreFocus, toggleRow, clear, fmt, fmtSeconds, ring, sparkline, lineChart, paragraphs, chunks, prose, segmented, statTile, emptyLine
 };

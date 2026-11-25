@@ -3,7 +3,7 @@
    the measurement log. Static facts live in Profile.md frontmatter; every
    measurement is a dated row in Body Log.md. */
 
-const { el, ico, clear, fmt, fmtSeconds, sparkline, clickableCard, statTile, emptyLine } = require('./dom');
+const { el, ico, clear, fmt, fmtSeconds, lineChart, clickableCard, statTile, emptyLine } = require('./dom');
 const { progressOf } = require('./voice-pack');
 const sound = require('./sound');
 const { BODY_COLUMNS } = require('./constants');
@@ -71,7 +71,7 @@ function render(ctx, root) {
         el('span', { class: 'gv-section-title-inline' }, 'Weight trend'),
         el('span', { class: `gv-trend-delta${delta < 0 ? ' downs' : delta > 0 ? ' ups' : ''}` },
           `${delta > 0 ? '+' : ''}${delta} kg since ${fmtShort(series[0].date)}`)),
-      sparkline(series, 320, 72, 'Body weight trend')));
+      lineChart(series, 600, 170, 'Body weight trend')));
   }
 
   /* Measurement log + add. */

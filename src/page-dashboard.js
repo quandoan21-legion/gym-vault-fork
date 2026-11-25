@@ -3,7 +3,7 @@
    lime flood on this screen is the action slab, and it holds nothing but
    the session stats and the start button (design/06-editorial-floor.html). */
 
-const { el, ico, fmt, fmtSeconds, sparkline, clickableCard, statTile, emptyLine } = require('./dom');
+const { el, ico, fmt, fmtSeconds, lineChart, clickableCard, statTile, emptyLine } = require('./dom');
 const { WEEKDAYS, WEEKDAY_LABELS } = require('./constants');
 const { todayISO, weekdayKey, fmtShort, ISO_DATE } = require('./dates');
 const { workoutDates, workoutDate, dayStreak, sessionCount, sessionsInWeek, goalCurrent, goalProgress, sessionSets, countLabel, countNoun, weightSeries } = require('./stats');
@@ -457,7 +457,7 @@ function render(ctx, root) {
         el('span', { class: 'gv-section-title-inline' }, 'Weight trend'),
         el('span', { class: `gv-trend-delta${delta < 0 ? ' downs' : delta > 0 ? ' ups' : ''}` },
           `${delta > 0 ? '+' : ''}${delta} kg since ${fmtShort(bodySeries[0].date)}`)),
-      sparkline(bodySeries, 320, 72, 'Body weight trend')));
+      lineChart(bodySeries, 600, 170, 'Body weight trend')));
   }
 
   root.append(page);
