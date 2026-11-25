@@ -3,10 +3,10 @@
    lime flood on this screen is the action slab, and it holds nothing but
    the session stats and the start button (design/06-editorial-floor.html). */
 
-const { el, ico, fmt, fmtSeconds, lineChart, clickableCard, statTile, emptyLine } = require('./dom');
+const { el, ico, fmt, fmtSeconds, clickableCard, statTile, emptyLine } = require('./dom');
 const { WEEKDAYS, WEEKDAY_LABELS } = require('./constants');
 const { todayISO, weekdayKey, fmtShort, ISO_DATE } = require('./dates');
-const { workoutDates, workoutDate, dayStreak, sessionCount, sessionsInWeek, goalCurrent, goalProgress, sessionSets, countLabel, countNoun, weightSeries } = require('./stats');
+const { workoutDates, workoutDate, dayStreak, sessionCount, sessionsInWeek, goalCurrent, goalProgress, sessionSets, countLabel, countNoun } = require('./stats');
 const { streakFlame } = require('./streak-flame');
 const { itemSets, isRestDay, targetDurationSeconds } = require('./plan-parse');
 const { equipmentFor } = require('./equipment');
@@ -440,24 +440,6 @@ function render(ctx, root) {
     if (!ranked.length) wrap.append(emptyLine('All goals hit — set a new one!'));
     page.append(wrap);
     page.append(el('p', { class: 'gv-microcopy' }, 'No zero days.'));
-  }
-
-  /* Body-weight trend, mirrored from Profile so the weigh-ins you bank with
-     each session are visible right here on Today (tap to open the full Body
-     log). Shows only once there are two points to draw a line between. */
-  const bodySeries = weightSeries(data.body);
-  if (bodySeries.length >= 2) {
-    const first = bodySeries[0].value, last = bodySeries[bodySeries.length - 1].value;
-    const delta = Math.round((last - first) * 10) / 10;
-    page.append(el('div', { class: 'gv-section-title' }, ico('scale'), el('span', {}, 'Body weight')));
-    page.append(clickableCard(
-      { class: 'gv-card gv-trend-card', 'aria-label': 'Body weight trend — open Profile' },
-      () => ctx.nav('profile'),
-      el('div', { class: 'gv-trend-head' },
-        el('span', { class: 'gv-section-title-inline' }, 'Weight trend'),
-        el('span', { class: `gv-trend-delta${delta < 0 ? ' downs' : delta > 0 ? ' ups' : ''}` },
-          `${delta > 0 ? '+' : ''}${delta} kg since ${fmtShort(bodySeries[0].date)}`)),
-      lineChart(bodySeries, 600, 170, 'Body weight trend')));
   }
 
   root.append(page);

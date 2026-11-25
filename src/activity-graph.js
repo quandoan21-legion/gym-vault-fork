@@ -134,25 +134,48 @@ function monthGraph(host, byDay, opts) {
       if (has) { total += value; nvals++; }
       pts.push({ day, value, has });
     }
-    lbl.textContent = `${pfx}  (${Math.round(total)}${unit ? ' ' + unit : ''})`;
+    /* Most metrics read against zero (volume, reps — a half-volume day should
+       look half as tall). A metric can opt out with `zeroBased:false` (body
+       weight) to get a tight min..max window, so a 1 kg move is visible instead
+       of a flat line pinned near the top; `round` keeps its decimals. */
+    const metricNow = metrics ? metrics[mi] : null;
+    const zeroBased = !(metricNow && metricNow.zeroBased === false);
+    const rnd = (metricNow && metricNow.round) || 0;
+    const fmtV = v => rnd ? (Math.round(v * Math.pow(10, rnd)) / Math.pow(10, rnd)).toFixed(rnd) : String(Math.round(v));
+    const presentVals = pts.filter(p => p.has).map(p => p.value);
+    let lo = 0, top;
+    if (zeroBased) {
+      top = niceCeil(presentVals.reduce((mx, v) => Math.max(mx, v), 0));
+    } else if (presentVals.length) {
+      const mn = Math.min(...presentVals), mx = Math.max(...presentVals);
+      const pad = (mx - mn) || Math.max(1, Math.abs(mx) * 0.02);
+      lo = mn - pad * 0.3; top = mx + pad * 0.3;
+    } else { top = 1; }
+    if (top <= lo) top = lo + 1;
+
+    /* The month chip: a running total reads right for additive metrics, but
+       summing body weights is nonsense — show the latest reading instead. */
+    const headline = zeroBased
+      ? `${Math.round(total)}${unit ? ' ' + unit : ''}`
+      : (presentVals.length ? `${fmtV(presentVals[presentVals.length - 1])}${unit ? ' ' + unit : ''}` : '—');
+    lbl.textContent = `${pfx}  (${headline})`;
     prev.disabled = offset >= maxOffset;
     next.disabled = offset <= 0;
 
     const W = 320, H = 192, padL = 32, padR = 12, padT = 12, padB = 24;
     const plotW = W - padL - padR, plotH = H - padT - padB;
-    const top = niceCeil(pts.reduce((m, p) => Math.max(m, p.value), 0));
     const xAt = i => padL + (days === 1 ? 0 : (i / (days - 1)) * plotW);
-    const yAt = v => padT + plotH - (v / top) * plotH;
+    const yAt = v => padT + plotH - ((v - lo) / (top - lo)) * plotH;
 
     const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, class: 'gv-graph-svg', role: 'img', 'aria-label': `${name}, ${pfx}` });
     svg.setAttribute('style', 'width:100%; height:auto; display:block; overflow:visible;');
 
     for (let t = 0; t <= 4; t++) {
-      const v = top * t / 4;
+      const v = lo + (top - lo) * t / 4;
       const yy = yAt(v);
       svg.appendChild(svgEl('line', { x1: padL, y1: yy, x2: W - padR, y2: yy, stroke: 'var(--gv-line)', 'stroke-width': 1, 'stroke-dasharray': t ? '2 3' : '0' }));
       const tx = svgEl('text', { x: padL - 5, y: yy + 3, 'text-anchor': 'end', fill: 'var(--gv-ink-dim)', 'font-size': 8 });
-      tx.textContent = String(Math.round(v));
+      tx.textContent = fmtV(v);
       svg.appendChild(tx);
     }
     for (let day = 1; day <= days; day++) {
@@ -196,7 +219,7 @@ function monthGraph(host, byDay, opts) {
         if (ev) ev.stopPropagation();
         if (selDot) { selDot.setAttribute('r', 3); selDot.setAttribute('fill', 'var(--gv-surface)'); }
         selDot = c; c.setAttribute('r', 4.5); c.setAttribute('fill', 'var(--gv-accent-line, var(--gv-lime))');
-        tip.show(hit, { title: `${pfx}-${String(p.day).padStart(2, '0')}`, label: curLabel, value: `${Math.round(p.value)}${unit ? ' ' + unit : ''}` });
+        tip.show(hit, { title: `${pfx}-${String(p.day).padStart(2, '0')}`, label: curLabel, value: `${fmtV(p.value)}${unit ? ' ' + unit : ''}` });
       };
       svg.appendChild(hit);
     });
