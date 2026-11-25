@@ -76,6 +76,7 @@ function monthGraph(host, byDay, opts) {
 
   /* ---- controls (only in the metrics/filters shape) ---- */
   const metricChips = [];
+  let filterWrap = null;             // the filter dropdowns, hidden for metrics that ignore them
   if (metrics || filters) {
     /* one flex row, every control the same gv-chip component, so metric chips
        and filter dropdowns share a height/baseline (no misalignment). */
@@ -86,7 +87,11 @@ function monthGraph(host, byDay, opts) {
       metricChips.push(b);
       controls.append(b);
     });
-    if (filters) for (const f of filters) controls.append(buildDropdown(f.options, '', v => { sel[f.key] = v; render(); }));
+    if (filters) {
+      filterWrap = el('span', { style: 'display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px;' });
+      for (const f of filters) filterWrap.append(buildDropdown(f.options, '', v => { sel[f.key] = v; render(); }));
+      controls.append(filterWrap);
+    }
     wrap.append(controls);
   }
 
@@ -139,6 +144,10 @@ function monthGraph(host, byDay, opts) {
        weight) to get a tight min..max window, so a 1 kg move is visible instead
        of a flat line pinned near the top; `round` keeps its decimals. */
     const metricNow = metrics ? metrics[mi] : null;
+    /* A metric can declare it ignores the filters (body weight isn't per
+       exercise/muscle) — hide them so they don't read as controls that do
+       nothing. */
+    if (filterWrap) filterWrap.style.display = (metricNow && metricNow.usesFilters === false) ? 'none' : 'inline-flex';
     const zeroBased = !(metricNow && metricNow.zeroBased === false);
     const rnd = (metricNow && metricNow.round) || 0;
     const fmtV = v => rnd ? (Math.round(v * Math.pow(10, rnd)) / Math.pow(10, rnd)).toFixed(rnd) : String(Math.round(v));

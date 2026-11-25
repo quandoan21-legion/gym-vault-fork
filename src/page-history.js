@@ -95,7 +95,7 @@ function render(ctx, root) {
   for (const r of (data.body || [])) { const wv = num(r.weight_kg); if (r.date && wv !== null) bodyByDate[r.date] = wv; }
   monthGraph(root, null, {
     ariaName: 'Gym', label: 'Gym',
-    metrics: [{ key: 'volume', label: 'Volume', unit: 'kg' }, { key: 'maxweight', label: 'Max kg', unit: 'kg' }, { key: 'reps', label: 'Reps', unit: '' }, { key: 'bodyweight', label: 'Weight', unit: 'kg', zeroBased: false, round: 1 }],
+    metrics: [{ key: 'volume', label: 'Volume', unit: 'kg' }, { key: 'maxweight', label: 'Max kg', unit: 'kg' }, { key: 'reps', label: 'Reps', unit: '' }, { key: 'bodyweight', label: 'Weight', unit: 'kg', zeroBased: false, round: 1, usesFilters: false }],
     filters: [
       { key: 'exercise', label: 'Exercise', options: [{ value: '', label: 'All exercises' }].concat(exNames.map(e => ({ value: e, label: e }))) },
       { key: 'muscle', label: 'Muscle', options: [{ value: '', label: 'All muscles' }].concat(muscleNames.map(m => ({ value: m, label: m }))) },

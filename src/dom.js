@@ -262,7 +262,7 @@ function lineChart(points, w, h, label) {
   const d = points.map((p, i) => `${i ? 'L' : 'M'}${px(i).toFixed(1)},${py(p.value).toFixed(1)}`).join(' ');
   svg.appendChild(mk('path', { d, class: 'gv-spark-line' }));
   points.forEach((p, i) => svg.appendChild(mk('circle', {
-    cx: px(i).toFixed(1), cy: py(p.value).toFixed(1), r: i === points.length - 1 ? 4 : 3, class: 'gv-spark-dot',
+    cx: px(i).toFixed(1), cy: py(p.value).toFixed(1), r: i === points.length - 1 ? 4 : 3, class: 'gv-chart-dot',
   })));
   /* label the latest reading above its dot */
   const lastV = vals[vals.length - 1];

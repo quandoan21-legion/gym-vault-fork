@@ -1620,17 +1620,20 @@ body.is-phone .gv-app .gv-mv-map .gv-mm-detailed .gv-mm-svg { max-height: 48vh; 
 .theme-dark .gv-app .gv-trend-delta.downs { color: var(--gv-lime); }
 .gv-trend-delta.ups { color: var(--gv-ink); }
 .gv-spark { width: 100%; height: 72px; }
-.gv-spark-line { fill: none; stroke: var(--gv-lime); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.gv-spark-line { fill: none; stroke: var(--gv-accent-line, var(--gv-lime)); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
 .gv-spark-dot { fill: var(--gv-lime-deep); }
 
 /* Line chart (axes + dated labels) — scales uniformly: width fills the card,
    height follows the viewBox aspect, so the trend is never squashed and the
-   text stays crisp. Grey labels read on both the paper and dark grounds. */
-.gv-chart { width: 100%; height: auto; display: block; }
-.gv-chart-grid { stroke: rgba(130, 130, 130, 0.22); stroke-width: 1; }
-.gv-chart-ylabel { fill: rgba(130, 130, 130, 0.95); font-size: 15px; text-anchor: end; }
-.gv-chart-xlabel { fill: rgba(130, 130, 130, 0.95); font-size: 15px; }
-.gv-chart-vlabel { fill: var(--gv-lime-deep); font-size: 16px; font-weight: 700; }
+   text stays crisp. Colours ride the theme tokens and the month-graph's
+   treatment (dashed grid, ringed dots, accent line) so the two charts read as
+   one component, not two. */
+.gv-chart { width: 100%; height: auto; display: block; overflow: visible; }
+.gv-chart-grid { stroke: var(--gv-line); stroke-width: 1; stroke-dasharray: 2 3; }
+.gv-chart-ylabel { fill: var(--gv-ink-dim); font-size: 14px; text-anchor: end; }
+.gv-chart-xlabel { fill: var(--gv-ink-dim); font-size: 14px; }
+.gv-chart-vlabel { fill: var(--gv-accent-text, var(--gv-lime-deep)); font-size: 15px; font-weight: 700; }
+.gv-chart-dot { fill: var(--gv-surface); stroke: var(--gv-accent-line, var(--gv-lime)); stroke-width: 2; }
 
 .gv-body-row { padding: 10px 14px; margin-bottom: -1px; }
 .gv-body-date { font-family: var(--gv-display); font-size: 16px; text-transform: uppercase; }
