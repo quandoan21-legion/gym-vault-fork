@@ -37,8 +37,8 @@ const plans = fs.readFileSync(path.join(__dirname, '..', 'src', 'page-plans.js')
 {
   assert.match(plans, /const exs = ctx\.data\.exercises;/,
     "the Add-exercise picker must read the live exercise list (ctx.data.exercises)");
-  assert.match(plans, /\.map\(e => \[e\.name, e\.name\]\)/,
-    "the Add-exercise dropdown's options must be built from that list — the fact the copy is describing");
+  assert.match(plans, /exs\.map\(e => \(\{ name: e\.name/,
+    "the Add-exercise picker's exercise list must be built from that list — the fact the copy is describing");
 }
 
 console.log('exercise delete copy OK (the confirmation names both what survives and what quietly changes)');

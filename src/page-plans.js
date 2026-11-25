@@ -9,7 +9,7 @@ const { WEEKDAYS, WEEKDAY_LABELS } = require('./constants');
 const { addItem, removeItemAt, moveItem, updateItem, isRestDay, parsePrescription, isPaused } = require('./plan-parse');
 const { equipmentFor, equipmentKeys, equipmentSummary, planExerciseNames, labelFor } = require('./equipment');
 const { MUSCLE_GROUPS } = require('./constants');
-const { FormModal, ConfirmModal } = require('./modals');
+const { FormModal, ConfirmModal, AddExerciseModal } = require('./modals');
 const { todayISO, weekdayKey } = require('./dates');
 const { sameName } = require('./stats');
 
@@ -671,41 +671,35 @@ function exerciseMuscles(e) {
 
 function openAddItem(ctx, plan, day) {
   const exs = ctx.data.exercises;
-  const exOptions = muscle => exs
-    .filter(e => !muscle || exerciseMuscles(e).includes(muscle))
-    .map(e => [e.name, e.name]);
-  const allMuscles = [...new Set(exs.flatMap(exerciseMuscles))].sort();
-  const hasExs = exs.length > 0;
-
-  const fields = [];
-  /* Optional muscle-group filter: narrows the Exercise dropdown below it.
-     Only shown when there are exercises carrying muscle metadata. */
-  if (hasExs && allMuscles.length) {
-    fields.push({
-      key: 'muscle', label: 'Muscle group', kind: 'dropdown',
-      options: [['', 'All muscles'], ...allMuscles.map(m => [m, m])], value: '',
-      onChange: (v, modal) => modal.setOptions('exercise', exOptions(v)),
-    });
+  /* When exercises have muscle metadata, show the interactive body map picker.
+     Fall back to the plain FormModal when there are no exercises at all. */
+  if (exs.length) {
+    const exercises = exs.map(e => ({ name: e.name, muscles: exerciseMuscles(e) }));
+    new AddExerciseModal(ctx.app, {
+      title: `Add to ${day.name}`,
+      exercises,
+      onSubmit: async ({ exercise, sets, target }) => {
+        addItem(day, { exercise, sets, target });
+        await saveThenReload(ctx, plan);
+      },
+    }).open();
+    return;
   }
-  const startOpts = exOptions('');
-  fields.push(hasExs
-    ? { key: 'exercise', label: 'Exercise', kind: 'dropdown', options: startOpts, value: (startOpts[0] || [''])[0] }
-    : { key: 'exercise', label: 'Exercise', kind: 'text', placeholder: 'e.g. Pull-ups' });
-  fields.push({ key: 'sets', label: 'Sets', kind: 'number', value: '3' });
-  fields.push({ key: 'reps', label: 'Reps', kind: 'text', placeholder: '8-12, submax, 30-45s', desc: 'Reps, a range, or seconds for a timed hold' });
-  fields.push({ key: 'weight', label: 'Weight (kg)', kind: 'number', value: '', placeholder: 'optional' });
-
+  /* No exercises library — text input fallback. */
   new FormModal(ctx.app, {
     title: `Add to ${day.name}`,
-    fields,
+    fields: [
+      { key: 'exercise', label: 'Exercise', kind: 'text', placeholder: 'e.g. Pull-ups' },
+      { key: 'sets', label: 'Sets', kind: 'number', value: '3' },
+      { key: 'reps', label: 'Reps', kind: 'text', placeholder: '8-12, submax, 30-45s', desc: 'Reps, a range, or seconds for a timed hold' },
+      { key: 'weight', label: 'Weight (kg)', kind: 'number', value: '', placeholder: 'optional' },
+    ],
     submitLabel: 'Add',
     validate: v => (!String(v.exercise).trim() ? 'Pick an exercise.' : null),
     onSubmit: async v => {
       const sets = parseInt(v.sets, 10);
       const reps = String(v.reps || '').trim();
       const w = String(v.weight || '').trim();
-      /* Reps + weight recombine into the same free-text `target` the parser
-         already round-trips (e.g. "8-12 @ 20kg"); weight is optional. */
       const target = [reps, w ? `@ ${w}kg` : ''].filter(Boolean).join(' ').trim();
       addItem(day, { exercise: String(v.exercise).trim(), sets: Number.isFinite(sets) && sets > 0 ? sets : null, target });
       await saveThenReload(ctx, plan);

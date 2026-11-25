@@ -6,6 +6,7 @@
 const { Modal, Setting, Notice } = require('obsidian');
 const { el, clickableCard } = require('./dom');
 const { DEFAULT_SETTINGS, skinClasses } = require('./constants');
+const { bodyMap, SLUG_TO_APP } = require('./body-map');
 
 /* A modal action that fails must SAY so. These all used to land in
    console.error alone, which on a phone is invisible — a delete that threw
@@ -216,4 +217,116 @@ function planSummary(p) {
   return `${days.length} day${days.length === 1 ? '' : 's'} · ${days.map(d => d.weekday).join(', ')}`;
 }
 
-module.exports = { FormModal, ConfirmModal, EndSessionModal, PlanPickerModal };
+/* Body-map exercise picker — replaces the muscle dropdown in Add exercise.
+   exercises: [{name: string, muscles: string[]}]
+   onSubmit({exercise, sets, reps, weight}) */
+class AddExerciseModal extends Modal {
+  constructor(app, { title, exercises, onSubmit }) {
+    super(app);
+    this.titleText  = title;
+    this.exercises  = exercises;   // [{name, muscles:[]}]
+    this.onSubmit   = onSubmit;
+    this._selSlug   = null;        // currently selected body-map slug
+    this._selEx     = null;        // chosen exercise name
+    this._map       = null;        // bodyMap controller
+    this._exListEl  = null;
+    this._errEl     = null;
+    this._sets = '3'; this._reps = ''; this._weight = '';
+  }
+
+  onOpen() {
+    wearApp(this.modalEl);
+    this.modalEl.addClass('gv-modal gv-add-ex-modal');
+    this.titleEl.setText(this.titleText);
+    const c = this.contentEl;
+
+    /* ---- body map ---- */
+    const mapWrap = c.createDiv({ cls: 'gv-add-ex-map' });
+    const allMuscles = [...new Set(this.exercises.flatMap(e => e.muscles))];
+    this._map = bodyMap(mapWrap, {
+      allMuscles,
+      onMuscle: (slug) => {
+        this._selSlug = slug;
+        this._selEx = null;      // clear exercise selection when muscle changes
+        this._renderList();
+      },
+    });
+
+    /* muscle label row */
+    this._muscleLbl = c.createDiv({ cls: 'gv-add-ex-muscle-lbl' });
+    this._updateMuscleLabel();
+
+    /* ---- exercise list ---- */
+    this._exListEl = c.createDiv({ cls: 'gv-add-ex-list' });
+    this._renderList();
+
+    /* ---- form fields ---- */
+    new Setting(c).setName('Sets').addText(t => {
+      t.inputEl.type = 'number'; t.setValue('3');
+      t.onChange(v => { this._sets = v; });
+    });
+    new Setting(c).setName('Reps').setDesc('Reps, a range, or seconds — prefills each set').addText(t => {
+      t.setPlaceholder('8-12, 30-45s…');
+      t.onChange(v => { this._reps = v; });
+    });
+    new Setting(c).setName('Weight (kg)').addText(t => {
+      t.setPlaceholder('optional'); t.inputEl.type = 'number';
+      t.onChange(v => { this._weight = v; });
+    });
+
+    this._errEl = c.createDiv({ cls: 'gv-modal-err' });
+    new Setting(c).addButton(b => b.setButtonText('Add').setCta().onClick(() => this._submit()));
+  }
+
+  _filteredExercises() {
+    if (!this._selSlug) return this.exercises;
+    const appMuscles = SLUG_TO_APP[this._selSlug] || [];
+    return this.exercises.filter(e => e.muscles.some(m => appMuscles.includes(m)));
+  }
+
+  _renderList() {
+    this._updateMuscleLabel();
+    const host = this._exListEl;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    const list = this._filteredExercises();
+    if (!list.length) {
+      host.append(el('div', { class: 'gv-add-ex-empty' }, 'No exercises for this muscle group.'));
+      return;
+    }
+    for (const ex of list) {
+      const item = el('div', { class: 'gv-add-ex-item' + (this._selEx === ex.name ? ' on' : '') }, ex.name);
+      item.onclick = () => { this._selEx = ex.name; this._renderList(); };
+      host.append(item);
+    }
+  }
+
+  _updateMuscleLabel() {
+    if (!this._muscleLbl) return;
+    if (this._selSlug) {
+      const appNames = (SLUG_TO_APP[this._selSlug] || []).join(', ');
+      this._muscleLbl.textContent = appNames;
+      this._muscleLbl.classList.add('has-sel');
+    } else {
+      this._muscleLbl.textContent = 'All muscles';
+      this._muscleLbl.classList.remove('has-sel');
+    }
+  }
+
+  _submit() {
+    if (!this._selEx) { this._errEl.setText('Pick an exercise from the list.'); return; }
+    this.close();
+    const sets = parseInt(this._sets, 10);
+    const reps = String(this._reps || '').trim();
+    const w    = String(this._weight || '').trim();
+    const target = [reps, w ? `@ ${w}kg` : ''].filter(Boolean).join(' ').trim();
+    Promise.resolve(this.onSubmit({
+      exercise: this._selEx,
+      sets: Number.isFinite(sets) && sets > 0 ? sets : null,
+      target,
+    })).catch(e => failed('save', e));
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
+
+module.exports = { FormModal, ConfirmModal, EndSessionModal, PlanPickerModal, AddExerciseModal };
