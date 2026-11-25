@@ -1634,6 +1634,33 @@ body.is-phone .gv-app .gv-mv-map .gv-mm-detailed .gv-mm-svg { max-height: 48vh; 
 .gv-chart-xlabel { fill: var(--gv-ink-dim); font-size: 14px; }
 .gv-chart-vlabel { fill: var(--gv-accent-text, var(--gv-lime-deep)); font-size: 15px; font-weight: 700; }
 .gv-chart-dot { fill: var(--gv-surface); stroke: var(--gv-accent-line, var(--gv-lime)); stroke-width: 2; }
+.gv-chart-line { fill: none; stroke: var(--gv-accent-line, var(--gv-lime)); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Themed dropdown — popup + items; active state via class so skins can restyle */
+.gv-dropdown-wrap { position: relative; display: inline-block; }
+.gv-dropdown-btn { display: inline-flex; align-items: center; gap: 6px; max-width: 180px; }
+.gv-dropdown-pop { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 4px; min-width: 100%; width: max-content; max-width: 280px; max-height: 260px; overflow: auto; background: var(--gv-surface); border: 1px solid var(--gv-line); border-radius: 6px; box-shadow: 0 8px 22px rgba(0,0,0,0.3); padding: 4px; display: none; }
+.gv-dropdown-item { padding: 6px 8px; font-size: 12px; border-radius: 4px; cursor: pointer; white-space: normal; line-height: 1.3; color: var(--gv-ink); }
+.gv-dropdown-item--on { background: var(--gv-accent-line, var(--gv-lime)); color: var(--gv-ink-fixed, #141a0e); }
+
+/* Graph controls row (shared by monthGraph and session-list) */
+.gv-graph-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.gv-graph-filter-wrap { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gv-graph-nav { display: flex; align-items: center; gap: 10px; margin: 2px 0 8px; }
+.gv-graph-month-lbl { font-weight: 700; min-width: 160px; text-align: center; }
+/* Axis labels for the month-graph SVG (keeps same visual as .gv-chart-ylabel but
+   at the smaller inline size the fixed-pixel SVG uses). */
+.gv-graph-ylabel { fill: var(--gv-ink-dim); font-size: 8px; text-anchor: end; }
+.gv-graph-xlabel { fill: var(--gv-ink-dim); font-size: 8px; }
+
+/* Chess game result — left-border signal so win/loss/draw are visually distinct */
+.gv-chess-win  { border-left: 3px solid var(--gv-lime); }
+.gv-chess-loss { opacity: 0.6; }
+.gv-chess-draw { border-left: 3px solid var(--gv-line); }
+
+/* Session card exercise row: flex header + small summary label */
+.gv-set-ex-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 10px 0 4px; }
+.gv-set-summary { font-size: 11px; white-space: nowrap; color: var(--gv-ink-dim); }
 
 .gv-body-row { padding: 10px 14px; margin-bottom: -1px; }
 .gv-body-date { font-family: var(--gv-display); font-size: 16px; text-transform: uppercase; }

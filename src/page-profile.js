@@ -68,7 +68,7 @@ function render(ctx, root) {
     const delta = Math.round((last - first) * 10) / 10;
     root.append(el('div', { class: 'gv-card gv-trend-card' },
       el('div', { class: 'gv-trend-head' },
-        el('span', { class: 'gv-section-title-inline' }, 'Weight trend'),
+        el('span', { class: 'gv-section-title' }, 'Weight trend'),
         el('span', { class: `gv-trend-delta${delta < 0 ? ' downs' : delta > 0 ? ' ups' : ''}` },
           `${delta > 0 ? '+' : ''}${delta} kg since ${fmtShort(series[0].date)}`)),
       lineChart(series, 600, 170, 'Body weight trend')));

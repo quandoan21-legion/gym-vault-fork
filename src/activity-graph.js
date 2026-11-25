@@ -35,19 +35,19 @@ function niceCeil(v) {
 /* A themed dropdown (native <select> popups can't follow the dark skin).
    Button shows the current label; a styled, scrollable popup lists options. */
 function buildDropdown(options, value, onPick) {
-  const wrap = el('div', { style: 'position:relative; display:inline-block;' });
+  const wrap = el('div', { class: 'gv-dropdown-wrap' });
   const cur = options.find(o => o.value === value) || options[0];
   const labelSpan = el('span', { style: 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, cur ? cur.label : '');
-  const btn = el('button', { type: 'button', class: 'gv-chip', style: 'display:inline-flex; align-items:center; gap:6px; max-width:180px;' }, labelSpan, ico('chevron-down'));
-  const pop = el('div', { style: 'position:absolute; z-index:20; top:100%; left:0; margin-top:4px; min-width:100%; width:max-content; max-width:280px; max-height:260px; overflow:auto; background:var(--gv-surface); border:1px solid var(--gv-line); border-radius:6px; box-shadow:0 8px 22px rgba(0,0,0,0.4); padding:4px; display:none;' });
+  const btn = el('button', { type: 'button', class: 'gv-chip gv-dropdown-btn' }, labelSpan, ico('chevron-down'));
+  const pop = el('div', { class: 'gv-dropdown-pop' });
 
   let open = false, docHandler = null;
   function close() { open = false; pop.style.display = 'none'; if (docHandler) { document.removeEventListener('click', docHandler, true); docHandler = null; } }
   function openPop() { open = true; pop.style.display = 'block'; docHandler = ev => { if (!wrap.contains(ev.target)) close(); }; setTimeout(() => document.addEventListener('click', docHandler, true), 0); }
 
-  const mark = (it, on) => { it.dataset.sel = on ? '1' : ''; it.style.background = on ? 'var(--gv-accent-line, var(--gv-lime))' : ''; it.style.color = on ? 'var(--gv-ink-fixed, #141a0e)' : 'var(--gv-ink)'; };
+  const mark = (it, on) => { it.dataset.sel = on ? '1' : ''; it.classList.toggle('gv-dropdown-item--on', on); if (!on) { it.style.background = ''; it.style.color = ''; } };
   options.forEach(o => {
-    const it = el('div', { style: 'padding:6px 8px; font-size:12px; border-radius:4px; cursor:pointer; white-space:normal; line-height:1.3;' }, o.label);
+    const it = el('div', { class: 'gv-dropdown-item' }, o.label);
     mark(it, o.value === value);
     it.onmouseenter = () => { if (it.dataset.sel !== '1') it.style.background = 'var(--gv-lime-ghost)'; };
     it.onmouseleave = () => { if (it.dataset.sel !== '1') it.style.background = ''; };
@@ -80,7 +80,7 @@ function monthGraph(host, byDay, opts) {
   if (metrics || filters) {
     /* one flex row, every control the same gv-chip component, so metric chips
        and filter dropdowns share a height/baseline (no misalignment). */
-    const controls = el('div', { style: 'display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px;' });
+    const controls = el('div', { class: 'gv-graph-controls' });
     if (metrics) metrics.forEach((m, idx) => {
       const b = el('button', { class: 'gv-chip' + (idx === 0 ? ' on' : ''), type: 'button' }, m.label);
       b.onclick = () => { mi = idx; metricChips.forEach((x, j) => x.classList.toggle('on', j === mi)); render(); };
@@ -88,16 +88,16 @@ function monthGraph(host, byDay, opts) {
       controls.append(b);
     });
     if (filters) {
-      filterWrap = el('span', { style: 'display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px;' });
+      filterWrap = el('span', { class: 'gv-graph-filter-wrap' });
       for (const f of filters) filterWrap.append(buildDropdown(f.options, '', v => { sel[f.key] = v; render(); }));
       controls.append(filterWrap);
     }
     wrap.append(controls);
   }
 
-  const nav = el('div', { style: 'display:flex; align-items:center; gap:10px; margin:2px 0 8px;' });
+  const nav = el('div', { class: 'gv-graph-nav' });
   const prev = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small', type: 'button', 'aria-label': 'Previous month' }, ico('chevron-left'));
-  const lbl = el('span', { style: 'font-weight:700; min-width:160px; text-align:center;' });
+  const lbl = el('span', { class: 'gv-graph-month-lbl' });
   const next = el('button', { class: 'gv-btn gv-btn-ghost gv-btn-small', type: 'button', 'aria-label': 'Next month' }, ico('chevron-right'));
   nav.append(prev, lbl, next);
   const canvas = el('div', {});
@@ -183,13 +183,13 @@ function monthGraph(host, byDay, opts) {
       const v = lo + (top - lo) * t / 4;
       const yy = yAt(v);
       svg.appendChild(svgEl('line', { x1: padL, y1: yy, x2: W - padR, y2: yy, stroke: 'var(--gv-line)', 'stroke-width': 1, 'stroke-dasharray': t ? '2 3' : '0' }));
-      const tx = svgEl('text', { x: padL - 5, y: yy + 3, 'text-anchor': 'end', fill: 'var(--gv-ink-dim)', 'font-size': 8 });
+      const tx = svgEl('text', { x: padL - 5, y: yy + 3, class: 'gv-graph-ylabel' });
       tx.textContent = fmtV(v);
       svg.appendChild(tx);
     }
     for (let day = 1; day <= days; day++) {
       if (day !== 1 && day % 5 !== 0) continue;
-      const tx = svgEl('text', { x: xAt(day - 1), y: H - padB + 12, 'text-anchor': 'middle', fill: 'var(--gv-ink-dim)', 'font-size': 8 });
+      const tx = svgEl('text', { x: xAt(day - 1), y: H - padB + 12, class: 'gv-graph-xlabel', 'text-anchor': 'middle' });
       tx.textContent = String(day);
       svg.appendChild(tx);
     }

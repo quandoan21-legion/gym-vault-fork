@@ -183,32 +183,6 @@ function ring(progress, size, label) {
   return svg;
 }
 
-/* Sparkline for a [{date, value}] series. */
-function sparkline(points, w, h, label) {
-  const NS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(NS, 'svg');
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  svg.setAttribute('class', 'gv-spark');
-  svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', label || 'Trend');
-  if (!points || points.length < 2) return svg;
-  const vals = points.map(p => p.value);
-  const min = Math.min(...vals), max = Math.max(...vals);
-  const span = max - min || 1;
-  const px = i => 4 + (i / (points.length - 1)) * (w - 8);
-  const py = val => h - 6 - ((val - min) / span) * (h - 12);
-  const d = points.map((p, i) => `${i ? 'L' : 'M'}${px(i).toFixed(1)},${py(p.value).toFixed(1)}`).join(' ');
-  const path = document.createElementNS(NS, 'path');
-  path.setAttribute('d', d);
-  path.setAttribute('class', 'gv-spark-line');
-  svg.appendChild(path);
-  const last = document.createElementNS(NS, 'circle');
-  last.setAttribute('cx', px(points.length - 1)); last.setAttribute('cy', py(vals[vals.length - 1]));
-  last.setAttribute('r', 3); last.setAttribute('class', 'gv-spark-dot');
-  svg.appendChild(last);
-  return svg;
-}
-
 /* A readable line chart: y gridlines with values, dated x labels, and a dot
    per reading. sparkline() is the bare trend line; this is the "show me the
    numbers" version used for the body-weight log. points: [{date, value}].
@@ -260,7 +234,7 @@ function lineChart(points, w, h, label) {
   });
   /* the trend line + a dot per reading */
   const d = points.map((p, i) => `${i ? 'L' : 'M'}${px(i).toFixed(1)},${py(p.value).toFixed(1)}`).join(' ');
-  svg.appendChild(mk('path', { d, class: 'gv-spark-line' }));
+  svg.appendChild(mk('path', { d, class: 'gv-chart-line' }));
   points.forEach((p, i) => svg.appendChild(mk('circle', {
     cx: px(i).toFixed(1), cy: py(p.value).toFixed(1), r: i === points.length - 1 ? 4 : 3, class: 'gv-chart-dot',
   })));
@@ -632,5 +606,5 @@ function statTile(icon, big, label, extraClass) {
 const emptyLine = (...kids) => el('div', { class: 'gv-empty-line' }, ...kids);
 
 module.exports = {
-  backButton, numericInput, normaliseNumber, el, ico, clickableCard, focusOpener, restoreFocus, toggleRow, clear, fmt, fmtSeconds, ring, sparkline, lineChart, paragraphs, chunks, prose, segmented, statTile, emptyLine
+  backButton, numericInput, normaliseNumber, el, ico, clickableCard, focusOpener, restoreFocus, toggleRow, clear, fmt, fmtSeconds, ring, lineChart, paragraphs, chunks, prose, segmented, statTile, emptyLine
 };

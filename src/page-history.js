@@ -128,7 +128,7 @@ function render(ctx, root) {
   root.append(el('div', { class: 'gv-section-title' }, ico('history'), el('span', {}, 'Sessions')));
   let sortKey = 'new';
   const fsel = {};
-  const scontrols = el('div', { style: 'display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px;' });
+  const scontrols = el('div', { class: 'gv-graph-controls' });
   scontrols.append(buildDropdown([{ value: 'new', label: 'Newest' }, { value: 'old', label: 'Oldest' }], 'new', v => { sortKey = v; renderSessions(); }));
   scontrols.append(buildDropdown([{ value: '', label: 'All exercises' }].concat(exNames.map(e => ({ value: e, label: e }))), '', v => { fsel.exercise = v; renderSessions(); }));
   scontrols.append(buildDropdown([{ value: '', label: 'All muscles' }].concat(muscleNames.map(m => ({ value: m, label: m }))), '', v => { fsel.muscle = v; renderSessions(); }));
@@ -216,9 +216,9 @@ function sessionCard(ctx, w, open) {
       if (topW) summary.push(`top ${topW}kg`);
       if (gVol) summary.push(`${gVol}kg`);
 
-      table.append(el('div', { style: 'display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin:10px 0 4px;' },
-        el('span', { class: 'gv-set-ex', style: 'margin:0;' }, g.exercise),
-        el('span', { class: 'gv-dim', style: 'font-size:11px; white-space:nowrap;' }, summary.join(' · '))));
+      table.append(el('div', { class: 'gv-set-ex-row' },
+        el('span', { class: 'gv-set-ex' }, g.exercise),
+        el('span', { class: 'gv-set-summary gv-dim' }, summary.join(' · '))));
 
       /* Collapse consecutive identical sets: 10×17.5, 10×17.5 -> "2× 10×17.5". */
       const toks = [];
