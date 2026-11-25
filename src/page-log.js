@@ -11,7 +11,7 @@ const { todayISO, fmtShort, fromISO, toISO } = require('./dates');
 const { setCounts, sameName } = require('./stats');
 const { targetFirstNumber, targetWeight, targetIsDuration, targetDurationSeconds, itemSets } = require('./plan-parse');
 
-const { FormModal, ConfirmModal, EndSessionModal } = require('./modals');
+const { FormModal, ConfirmModal, EndSessionModal, AddExerciseModal } = require('./modals');
 const { RepCounterModal } = require('./rep-counter-modal');
 const { motionPref, setMotionPref } = require('./motion-count');
 const rewardsFlow = require('./rewards-flow');
@@ -368,42 +368,33 @@ function exerciseMuscles(e) {
 
 function openAddExercise(ctx, draft) {
   const exs = ctx.data.exercises;
-  const exOptions = muscle => exs
-    .filter(e => !muscle || exerciseMuscles(e).includes(muscle))
-    .map(e => [e.name, e.name]);
-  const allMuscles = [...new Set(exs.flatMap(exerciseMuscles))].sort();
-  const hasExs = exs.length > 0;
-
-  const fields = [];
-  /* Optional muscle-group filter narrows the Exercise dropdown below it. */
-  if (hasExs && allMuscles.length) {
-    fields.push({
-      key: 'muscle', label: 'Muscle group', kind: 'dropdown',
-      options: [['', 'All muscles'], ...allMuscles.map(m => [m, m])], value: '',
-      onChange: (v, modal) => modal.setOptions('exercise', exOptions(v)),
-    });
+  if (exs.length) {
+    const exercises = exs.map(e => ({ name: e.name, muscles: exerciseMuscles(e) }));
+    new AddExerciseModal(ctx.app, {
+      title: 'Add exercise',
+      exercises,
+      onSubmit: ({ exercise, sets, target }) => {
+        draft.entries.push(makeEntry(ctx, exercise, sets || 3, target));
+        ctx.rerender();
+      },
+    }).open();
+    return;
   }
-  const startOpts = exOptions('');
-  fields.push(hasExs
-    ? { key: 'exercise', label: 'Exercise', kind: 'dropdown', options: startOpts, value: (startOpts[0] || [''])[0] }
-    : { key: 'exercise', label: 'Exercise', kind: 'text', placeholder: 'e.g. Pull-ups' });
-  fields.push({ key: 'sets', label: 'Sets', kind: 'number', value: '3' });
-  fields.push({ key: 'reps', label: 'Reps', kind: 'text', placeholder: '8-12, 30-45s', desc: 'Reps, a range, or seconds — prefills each set' });
-  fields.push({ key: 'weight', label: 'Weight (kg)', kind: 'number', value: '', placeholder: 'optional' });
-
+  /* No exercises library — text input fallback. */
   new FormModal(ctx.app, {
     title: 'Add exercise',
-    fields,
+    fields: [
+      { key: 'exercise', label: 'Exercise', kind: 'text', placeholder: 'e.g. Pull-ups' },
+      { key: 'sets', label: 'Sets', kind: 'number', value: '3' },
+      { key: 'reps', label: 'Reps', kind: 'text', placeholder: '8-12, 30-45s', desc: 'Reps, a range, or seconds — prefills each set' },
+      { key: 'weight', label: 'Weight (kg)', kind: 'number', value: '', placeholder: 'optional' },
+    ],
     submitLabel: 'Add',
     validate: v => (!String(v.exercise).trim() ? 'Pick an exercise.' : null),
     onSubmit: v => {
       const sets = parseInt(v.sets, 10);
       const reps = String(v.reps || '').trim();
       const w = String(v.weight || '').trim();
-      /* reps + weight become the entry's `target`; makeEntry reads it to
-         prefill each set's reps and weight_kg (targetWeight parses "@ Nkg",
-         targetFirstNumber ignores that part, so a weight-only entry prefills
-         the load without a bogus rep count). */
       const target = [reps, w ? `@ ${w}kg` : ''].filter(Boolean).join(' ').trim();
       draft.entries.push(makeEntry(ctx, String(v.exercise).trim(), Number.isFinite(sets) && sets > 0 ? sets : 3, target));
       ctx.rerender();
